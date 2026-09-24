@@ -10,6 +10,11 @@ function inputs(overrides: Partial<Inputs> = {}): Inputs {
     uuids: "resource123",
     tags: "",
     resourceType: "application",
+    applicationSlug: "",
+    project: "",
+    server: "",
+    environment: "",
+    createIfMissing: "",
     applicationFile: "",
     envFile: "",
     envPrefix: "COOLIFY_ENV_",
@@ -154,7 +159,7 @@ describe("Coolify deployment", () => {
     await expect(deploy(inputs({ uuids: "", tags: "frontend", envFile: "/tmp/env.json" }), f.deps))
       .rejects.toThrow("exactly one resource UUID");
     await expect(deploy(inputs({ uuids: "", tags: "" }), f.deps))
-      .rejects.toThrow("exactly one of uuids, tags, or application-file");
+      .rejects.toThrow("exactly one of uuids, tags, or application-slug/application-file");
     await expect(deploy(inputs({ dockerTag: "preview" }), f.deps))
       .rejects.toThrow("requires pull-request-id");
     expect(f.calls).toHaveLength(0);
@@ -269,7 +274,6 @@ describe("Coolify deployment", () => {
 
   test("creates a Docker Image application from its slug, adds storage, then configures and deploys", async () => {
     const spec = {
-      slug: "call-recorder-bot", project: "syntropika", server: "ovh1", environment: "production",
       create: { autogenerate_domain: false, health_check_enabled: false },
       update: { is_consistent_container_name_enabled: true, stop_grace_period: 300 },
       storages: [{ name: "call-recorder-data", mount_path: "/app/data" }],
@@ -287,7 +291,9 @@ describe("Coolify deployment", () => {
       [200, { deployments: [{ resource_uuid: "newapp123" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) }, { COOLIFY_ENV_API_KEY: "private-value" });
     const result = await deploy(inputs({
-      uuids: "", applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      environment: "production", createIfMissing: "true", applicationFile: "/tmp/app.json",
+      imageName: "ghcr.io/org/app", imageTag: "commit123",
       requiredEnvKeys: "API_KEY", wait: "false",
     }), f.deps);
     expect(result.status).toBe("accepted");
@@ -319,8 +325,7 @@ describe("Coolify deployment", () => {
   });
 
   test("reuses an application by slug within its project environment without recreating storage", async () => {
-    const spec = { slug: "call-recorder-bot", project: "syntropika", environment: "production",
-      storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] };
+    const spec = { storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] };
     const f = fixture([
       [200, [{ uuid: "project123", name: "syntropika" }]],
       [200, [{ id: 42, name: "production" }]],
@@ -339,7 +344,9 @@ describe("Coolify deployment", () => {
       [200, { deployments: [{ resource_uuid: "existing123" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) });
     const result = await deploy(inputs({
-      uuids: "", applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit456", wait: "false",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      environment: "production", applicationFile: "/tmp/app.json",
+      imageName: "ghcr.io/org/app", imageTag: "commit456", wait: "false",
     }), f.deps);
     expect(result.status).toBe("accepted");
     expect(f.calls.map((call) => `${call.method} ${new URL(call.url).pathname}`)).toEqual([
@@ -367,25 +374,35 @@ describe("Coolify deployment", () => {
       ]],
       [200, [{ is_primary: true, server_uuid: "server123" }]],
       [200, [{ is_primary: true, server_uuid: "server123" }]],
-    ], { "/tmp/app.json": JSON.stringify({ slug: "call-recorder-bot", project: "syntropika" }) });
+    ]);
     await expect(deploy(inputs({
-      uuids: "", applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      imageName: "ghcr.io/org/app", imageTag: "commit123",
     }), f.deps)).rejects.toThrow("ambiguous");
     expect(f.calls.every((call) => call.method === "GET")).toBe(true);
   });
 
   test("does not create an application when required runtime secrets are missing", async () => {
-    const f = fixture([], { "/tmp/app.json": JSON.stringify({ slug: "call-recorder-bot" }) });
+    const f = fixture([]);
     await expect(deploy(inputs({
-      uuids: "", applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      imageName: "ghcr.io/org/app", imageTag: "commit123",
       requiredEnvKeys: "DISCORD_TOKEN",
     }), f.deps)).rejects.toThrow("Required environment variable DISCORD_TOKEN is missing or empty");
     expect(f.calls).toHaveLength(0);
   });
 
+  test("rejects conflicting target identity between workflow inputs and legacy application files", async () => {
+    const f = fixture([], { "/tmp/app.json": JSON.stringify({ slug: "other-bot", project: "syntropika" }) });
+    await expect(deploy(inputs({
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika",
+      applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
+    }), f.deps)).rejects.toThrow("Application slug differs between the workflow and application-file");
+    expect(f.calls).toHaveLength(0);
+  });
+
   test("does not deploy when an existing persistent volume conflicts", async () => {
-    const spec = { slug: "call-recorder-bot", project: "syntropika", server: "ovh1",
-      storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] };
+    const spec = { storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] };
     const f = fixture([
       [200, [{ uuid: "project123", name: "syntropika" }]],
       [200, [{ id: 42, name: "production" }]],
@@ -396,7 +413,8 @@ describe("Coolify deployment", () => {
       [200, { persistent_storages: [{ name: "call-recorder-data", mount_path: "/wrong" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) });
     await expect(deploy(inputs({
-      uuids: "", applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
     }), f.deps)).rejects.toThrow("conflicts with an existing storage");
     expect(f.calls.every((call) => call.method === "GET")).toBe(true);
   });

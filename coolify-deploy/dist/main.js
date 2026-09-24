@@ -100,18 +100,35 @@ function options(value, context, forbidden) {
   }
   return result;
 }
-function applicationSpec(value) {
+function selected(input, override, context) {
+  if (!override)
+    return input;
+  if (input !== undefined && input !== override)
+    throw new Error(`${context} differs between the workflow and application-file`);
+  return override;
+}
+function applicationSpec(value, selection) {
   const input = object(value, "Application file");
   const allowed = new Set(["slug", "project", "server", "environment", "create_if_missing", "create", "update", "storages"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key))
       throw new Error(`Application file has unsupported field ${key}`);
   }
-  const slug = string(input.slug, "Application slug");
+  const slug = string(selected(input.slug, selection.slug, "Application slug"), "Application slug");
   if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)) {
     throw new Error("Application slug must use lowercase letters, digits, and hyphens (maximum 63 characters)");
   }
-  const createIfMissing = input.create_if_missing ?? true;
+  let createIfMissing = input.create_if_missing ?? true;
+  if (selection.createIfMissing) {
+    if (selection.createIfMissing !== "true" && selection.createIfMissing !== "false") {
+      throw new Error("create-if-missing must be true or false");
+    }
+    const override = selection.createIfMissing === "true";
+    if (input.create_if_missing !== undefined && input.create_if_missing !== override) {
+      throw new Error("create-if-missing differs between the workflow and application-file");
+    }
+    createIfMissing = override;
+  }
   if (typeof createIfMissing !== "boolean")
     throw new Error("create_if_missing must be true or false");
   const reserved = ["project_uuid", "server_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
@@ -138,11 +155,14 @@ function applicationSpec(value) {
     names.add(storage.name);
     paths.add(storage.mount_path);
   }
+  const project = selected(input.project, selection.project, "Application project");
+  const server = selected(input.server, selection.server, "Application server");
+  const environment = selected(input.environment, selection.environment, "Application environment");
   return {
     slug,
-    project: input.project === undefined ? "" : string(input.project, "Application project"),
-    server: input.server === undefined ? "" : string(input.server, "Application server"),
-    environment: input.environment === undefined ? "production" : string(input.environment, "Application environment"),
+    project: project === undefined ? "" : string(project, "Application project"),
+    server: server === undefined ? "" : string(server, "Application server"),
+    environment: environment === undefined ? "production" : string(environment, "Application environment"),
     create_if_missing: createIfMissing,
     create,
     update,
@@ -502,9 +522,19 @@ async function resourceType(requested, uuid, client, readToken) {
 async function deploy(inputs, deps = defaultDependencies) {
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
-  const application = inputs.applicationFile ? applicationSpec(await jsonFile(inputs.applicationFile, "Application", deps)) : undefined;
+  const applicationRequested = Boolean(inputs.applicationSlug || inputs.applicationFile);
+  if (!applicationRequested && (inputs.project || inputs.server || inputs.environment || inputs.createIfMissing)) {
+    throw new Error("project, server, environment, and create-if-missing require application-slug or application-file");
+  }
+  const application = applicationRequested ? applicationSpec(inputs.applicationFile ? await jsonFile(inputs.applicationFile, "Application", deps) : {}, {
+    slug: inputs.applicationSlug,
+    project: inputs.project,
+    server: inputs.server,
+    environment: inputs.environment,
+    createIfMissing: inputs.createIfMissing
+  }) : undefined;
   if (Number(uuids.length > 0) + Number(tags.length > 0) + Number(Boolean(application)) !== 1) {
-    throw new Error("Set exactly one of uuids, tags, or application-file");
+    throw new Error("Set exactly one of uuids, tags, or application-slug/application-file");
   }
   const mutatingRequested = Boolean(application || inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag || Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
   if (mutatingRequested && !application && (uuids.length !== 1 || tags.length > 0)) {
@@ -546,7 +576,7 @@ async function deploy(inputs, deps = defaultDependencies) {
   if (inputs.imageName && !inputs.imageTag)
     throw new Error("image-tag is required with image-name");
   if (application && !inputs.imageTag)
-    throw new Error("application-file requires image-name and image-tag");
+    throw new Error("application-slug requires image-name and image-tag");
   const writeToken = inputs.writeToken || sopsToken;
   const readToken = inputs.readToken || writeToken;
   if (mutating && !writeToken)
@@ -702,6 +732,11 @@ var inputs = {
   uuids: input("uuids"),
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
+  applicationSlug: input("application-slug"),
+  project: input("project"),
+  server: input("server"),
+  environment: input("environment"),
+  createIfMissing: input("create-if-missing"),
   applicationFile: input("application-file"),
   envFile: input("env-file"),
   envPrefix: input("env-prefix", "COOLIFY_ENV_"),

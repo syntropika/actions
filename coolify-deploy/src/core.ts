@@ -13,6 +13,11 @@ export interface Inputs {
   uuids: string;
   tags: string;
   resourceType: string;
+  applicationSlug: string;
+  project: string;
+  server: string;
+  environment: string;
+  createIfMissing: string;
   applicationFile: string;
   envFile: string;
   envPrefix: string;
@@ -332,11 +337,21 @@ async function resourceType(
 export async function deploy(inputs: Inputs, deps: Dependencies = defaultDependencies): Promise<Result> {
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
-  const application = inputs.applicationFile
-    ? applicationSpec(await jsonFile(inputs.applicationFile, "Application", deps))
+  const applicationRequested = Boolean(inputs.applicationSlug || inputs.applicationFile);
+  if (!applicationRequested && (inputs.project || inputs.server || inputs.environment || inputs.createIfMissing)) {
+    throw new Error("project, server, environment, and create-if-missing require application-slug or application-file");
+  }
+  const application = applicationRequested
+    ? applicationSpec(inputs.applicationFile ? await jsonFile(inputs.applicationFile, "Application", deps) : {}, {
+      slug: inputs.applicationSlug,
+      project: inputs.project,
+      server: inputs.server,
+      environment: inputs.environment,
+      createIfMissing: inputs.createIfMissing,
+    })
     : undefined;
   if (Number(uuids.length > 0) + Number(tags.length > 0) + Number(Boolean(application)) !== 1) {
-    throw new Error("Set exactly one of uuids, tags, or application-file");
+    throw new Error("Set exactly one of uuids, tags, or application-slug/application-file");
   }
   const mutatingRequested = Boolean(application || inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag ||
     Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
@@ -374,7 +389,7 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   }
   if (inputs.imageTag && !inputs.imageName) throw new Error("image-name is required with image-tag");
   if (inputs.imageName && !inputs.imageTag) throw new Error("image-tag is required with image-name");
-  if (application && !inputs.imageTag) throw new Error("application-file requires image-name and image-tag");
+  if (application && !inputs.imageTag) throw new Error("application-slug requires image-name and image-tag");
   const writeToken = inputs.writeToken || sopsToken;
   const readToken = inputs.readToken || writeToken;
   if (mutating && !writeToken) throw new Error("write-token is required for configuration updates");

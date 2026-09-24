@@ -6,15 +6,10 @@ The action uses the [Coolify deployment API](https://coolify.io/docs/api/endpoin
 
 ## Example: create or reuse a Docker Image application by slug
 
-Keep non-secret deployment settings in a JSON file in the calling repository:
+Declare the target in the calling workflow. Keep only application settings that do not fit the action inputs in a JSON file:
 
 ```json
 {
-  "slug": "call-recorder-bot",
-  "project": "syntropika",
-  "server": "ovh1",
-  "environment": "production",
-  "create_if_missing": true,
   "create": {
     "autogenerate_domain": false,
     "health_check_enabled": false
@@ -37,6 +32,11 @@ Then reference it from the deployment step:
   uses: syntropika/actions/coolify-deploy@v1
   with:
     url: ${{ vars.COOLIFY_URL }}
+    application-slug: call-recorder-bot
+    project: syntropika
+    server: ovh1
+    environment: production
+    create-if-missing: 'true'
     application-file: deployment/coolify/application.json
     image-name: ghcr.io/${{ github.repository }}
     image-tag: ${{ github.sha }}
@@ -45,7 +45,7 @@ Then reference it from the deployment step:
     deploy-token: ${{ secrets.COOLIFY_DEPLOY_TOKEN }}
 ```
 
-The action resolves the project, environment, and server by exact name or UUID. `project` and `server` may be omitted only when the API token can see exactly one of each; `environment` defaults to `production`. It finds an application by slug within that project, environment, and server. A missing application is created from the image, then its persistent storages, environment variables, and update settings are applied before deployment. Existing matching storage is reused. Duplicate slugs or conflicting storage definitions fail the step. Set `create_if_missing` to `false` to require an existing application. The API still uses the resolved resource UUID internally; the workflow does not need to store it.
+The action resolves the project, environment, and server by exact name or UUID. Declare them in the workflow so the deployment target is visible beside the action call. `project` and `server` may be omitted only when the API token can see exactly one of each; `environment` defaults to `production`. It finds an application by slug within that project, environment, and server. A missing application is created from the image, then its persistent storages, environment variables, and update settings are applied before deployment. Existing matching storage is reused. Duplicate slugs or conflicting storage definitions fail the step. Set `create-if-missing: 'false'` to require an existing application. The API still uses the resolved resource UUID internally; the workflow does not need to store it.
 
 `create` accepts fields from Coolify's [Docker Image create endpoint](https://coolify.io/docs/api/endpoints/applications/create-dockerimage-application). `update` accepts fields from its [application update endpoint](https://coolify.io/docs/api/endpoints/applications/update-application-by-uuid). The action owns the project, server, environment, name, image repository, and image tag fields, and disables instant deployment during creation so storage and secrets can be configured first. `storages` currently manages named persistent volumes by name and container mount path. Projects, environments, and servers must already exist.
 
@@ -133,11 +133,14 @@ An advanced environment file is an array of objects. Each object must have `key`
 | --- | --- | --- |
 | `url` | Yes | HTTPS Coolify URL, with or without `/api/v1`. |
 | `deploy-token` | Unless supplied by SOPS | Token with `deploy` permission. |
-| `uuids`, `tags`, or `application-file` | Exactly one | Resource UUIDs, Coolify tags, or a checked-in Docker Image application specification. |
+| `uuids`, `tags`, or `application-slug` | Exactly one | Resource UUIDs, Coolify tags, or a Docker Image application name. Legacy `application-file` identity fields are also accepted. |
 | `read-token` | To wait or inspect | Token with `read` permission. A `write-token` that also has `read` may serve both roles. |
 | `write-token` | To configure | Token with `write` permission for environment variables, pruning, patches, or image selection. |
 | `resource-type` | No | `application`, `service`, or `auto` (default). Only used while configuring a resource. |
-| `application-file` | No | Runner-local JSON specification that resolves an application by slug and optionally creates it. Requires `image-name`, `image-tag`, read and write tokens, and a checkout step. |
+| `application-slug` | For name-based deployment | Stable Docker Image application name; requires `image-name`, `image-tag`, read and write tokens. |
+| `project`, `server`, `environment` | With `application-slug` | Existing target names or UUIDs; `environment` defaults to `production`. |
+| `create-if-missing` | No | Create a missing Docker Image application; defaults to `true`. |
+| `application-file` | No | Optional runner-local JSON with `create`, `update`, and `storages` settings; requires checkout. |
 | `env-file` | No | Runner-local JSON object or array of environment variables. |
 | `env-prefix` | No | Step environment prefix to sync, default `COOLIFY_ENV_`. |
 | `required-env-keys` | No | Comma-separated environment keys that must be nonempty before contacting Coolify. |

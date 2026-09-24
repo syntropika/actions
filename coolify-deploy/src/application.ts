@@ -20,6 +20,14 @@ export interface ApplicationSpec {
   storages: PersistentStorage[];
 }
 
+export interface ApplicationSelection {
+  slug: string;
+  project: string;
+  server: string;
+  environment: string;
+  createIfMissing: string;
+}
+
 function object(value: unknown, context: string): JsonRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${context} must be a JSON object`);
@@ -52,17 +60,33 @@ function options(value: unknown, context: string, forbidden: string[]): JsonReco
   return result;
 }
 
-export function applicationSpec(value: unknown): ApplicationSpec {
+function selected(input: unknown, override: string, context: string): unknown {
+  if (!override) return input;
+  if (input !== undefined && input !== override) throw new Error(`${context} differs between the workflow and application-file`);
+  return override;
+}
+
+export function applicationSpec(value: unknown, selection: ApplicationSelection): ApplicationSpec {
   const input = object(value, "Application file");
   const allowed = new Set(["slug", "project", "server", "environment", "create_if_missing", "create", "update", "storages"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new Error(`Application file has unsupported field ${key}`);
   }
-  const slug = string(input.slug, "Application slug");
+  const slug = string(selected(input.slug, selection.slug, "Application slug"), "Application slug");
   if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)) {
     throw new Error("Application slug must use lowercase letters, digits, and hyphens (maximum 63 characters)");
   }
-  const createIfMissing = input.create_if_missing ?? true;
+  let createIfMissing: unknown = input.create_if_missing ?? true;
+  if (selection.createIfMissing) {
+    if (selection.createIfMissing !== "true" && selection.createIfMissing !== "false") {
+      throw new Error("create-if-missing must be true or false");
+    }
+    const override = selection.createIfMissing === "true";
+    if (input.create_if_missing !== undefined && input.create_if_missing !== override) {
+      throw new Error("create-if-missing differs between the workflow and application-file");
+    }
+    createIfMissing = override;
+  }
   if (typeof createIfMissing !== "boolean") throw new Error("create_if_missing must be true or false");
   const reserved = ["project_uuid", "server_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
   const create = options(input.create, "Application create options", reserved);
@@ -84,11 +108,14 @@ export function applicationSpec(value: unknown): ApplicationSpec {
     names.add(storage.name);
     paths.add(storage.mount_path);
   }
+  const project = selected(input.project, selection.project, "Application project");
+  const server = selected(input.server, selection.server, "Application server");
+  const environment = selected(input.environment, selection.environment, "Application environment");
   return {
     slug,
-    project: input.project === undefined ? "" : string(input.project, "Application project"),
-    server: input.server === undefined ? "" : string(input.server, "Application server"),
-    environment: input.environment === undefined ? "production" : string(input.environment, "Application environment"),
+    project: project === undefined ? "" : string(project, "Application project"),
+    server: server === undefined ? "" : string(server, "Application server"),
+    environment: environment === undefined ? "production" : string(environment, "Application environment"),
     create_if_missing: createIfMissing,
     create,
     update,

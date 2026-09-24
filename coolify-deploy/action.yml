@@ -1,5 +1,5 @@
 name: Coolify Deploy
-description: Configure a Coolify resource and deploy it by UUID or tag
+description: Find or create a Coolify application by slug, configure it, and deploy it
 author: Syntropika
 
 inputs:
@@ -16,13 +16,28 @@ inputs:
     description: Coolify token with write permission; required to update environment variables or resource configuration
     required: false
   uuids:
-    description: One or more resource UUIDs, separated by commas; exclusive with tags and application-file
+    description: One or more resource UUIDs, separated by commas; exclusive with tags and application-slug
     required: false
   tags:
-    description: One or more Coolify resource tags, separated by commas; exclusive with uuids and application-file
+    description: One or more Coolify resource tags, separated by commas; exclusive with uuids and application-slug
+    required: false
+  application-slug:
+    description: Stable Docker Image application name; exclusive with uuids and tags
+    required: false
+  project:
+    description: Existing Coolify project name or UUID used to resolve an application slug
+    required: false
+  server:
+    description: Existing Coolify server name or UUID used to resolve an application slug
+    required: false
+  environment:
+    description: Existing Coolify environment name used to resolve an application slug; defaults to production
+    required: false
+  create-if-missing:
+    description: Create the Docker Image application when the slug is absent; defaults to true
     required: false
   application-file:
-    description: JSON specification that finds a Docker Image application by slug in a project/environment or creates it if missing
+    description: Optional JSON create/update/storage settings for the Docker Image application; legacy identity fields remain supported
     required: false
   resource-type:
     description: application, service, or auto for resource configuration and environment updates
