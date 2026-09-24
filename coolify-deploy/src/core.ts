@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { decryptSops } from "./sops.ts";
 
 type ResourceType = "application" | "service";
 type JsonRecord = Record<string, unknown>;
@@ -12,6 +13,12 @@ export interface Inputs {
   tags: string;
   resourceType: string;
   envFile: string;
+  envPrefix: string;
+  requiredEnvKeys: string;
+  sopsFile: string;
+  sopsAgeKey: string;
+  sopsTokenKey: string;
+  sopsEnvKeys: string;
   pruneEnvKeys: string;
   patchFile: string;
   imageName: string;
@@ -43,6 +50,9 @@ export interface Dependencies {
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
   readFile: (path: string) => Promise<string>;
+  environmentVariables: NodeJS.ProcessEnv;
+  decryptSops: (path: string, ageKey: string) => Promise<unknown>;
+  mask: (value: string) => void;
   log: (message: string) => void;
   onAccepted: (deployments: Deployment[]) => void;
 }
@@ -52,6 +62,9 @@ export const defaultDependencies: Dependencies = {
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   now: Date.now,
   readFile: (path) => readFile(path, "utf8"),
+  environmentVariables: process.env,
+  decryptSops,
+  mask: (value) => console.log(`::add-mask::${value.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")}`),
   log: console.log,
   onAccepted: () => {},
 };
@@ -165,6 +178,60 @@ function environment(value: unknown): JsonRecord[] {
   });
 }
 
+async function environmentSources(inputs: Inputs, deps: Dependencies): Promise<{ entries: JsonRecord[]; sopsToken: string }> {
+  const prefix = required(inputs.envPrefix, "env-prefix");
+  if (!/^[A-Za-z_][A-Za-z0-9_]*_$/.test(prefix)) {
+    throw new Error("env-prefix must be an environment variable prefix ending in underscore");
+  }
+  const sources: Array<[string, JsonRecord[]]> = [];
+  if (inputs.envFile) sources.push(["env-file", environment(await jsonFile(inputs.envFile, "Environment", deps))]);
+  const prefixed: Record<string, string> = {};
+  for (const [name, value] of Object.entries(deps.environmentVariables)) {
+    if (name.startsWith(prefix) && value !== undefined) prefixed[name.slice(prefix.length)] = value;
+  }
+  if (Object.keys(prefixed).length > 0) sources.push(["step env", environment(prefixed)]);
+
+  let sopsToken = "";
+  if (inputs.sopsFile) {
+    const decrypted = record(await deps.decryptSops(inputs.sopsFile, required(inputs.sopsAgeKey, "sops-age-key")), "SOPS file");
+    const tokenKey = required(inputs.sopsTokenKey, "sops-token-key");
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenKey)) throw new Error("sops-token-key is invalid");
+    const candidate = decrypted[tokenKey];
+    if (candidate !== undefined && typeof candidate !== "string") throw new Error("SOPS token must be a string");
+    sopsToken = candidate ?? "";
+    const included = csv(inputs.sopsEnvKeys);
+    for (const key of included) {
+      if (key === tokenKey || !(key in decrypted)) throw new Error(`sops-env-keys contains unavailable environment key ${key}`);
+    }
+    const entries = Object.fromEntries(Object.entries(decrypted).filter(([key]) =>
+      key !== tokenKey && (included.length === 0 || included.includes(key))));
+    sources.push(["sops-file", environment(entries)]);
+  } else if (inputs.sopsAgeKey || inputs.sopsEnvKeys) {
+    throw new Error("sops-age-key and sops-env-keys require sops-file");
+  }
+
+  const seen = new Map<string, string>();
+  const entries: JsonRecord[] = [];
+  for (const [source, values] of sources) {
+    for (const entry of values) {
+      const key = entry.key as string;
+      const previous = seen.get(key);
+      if (previous) throw new Error(`Environment key ${key} appears in both ${previous} and ${source}`);
+      seen.set(key, source);
+      entries.push(entry);
+      if (entry.value) deps.mask(entry.value as string);
+    }
+  }
+  if (sopsToken) deps.mask(sopsToken);
+  for (const key of csv(inputs.requiredEnvKeys)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid required environment key ${key}`);
+    if (!entries.some((entry) => entry.key === key && Boolean(entry.value))) {
+      throw new Error(`Required environment variable ${key} is missing or empty`);
+    }
+  }
+  return { entries, sopsToken };
+}
+
 function pathPart(value: string, name: string): string {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} contains an invalid identifier`);
   return value;
@@ -266,10 +333,13 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   if ((uuids.length > 0) === (tags.length > 0)) {
     throw new Error("Set exactly one of uuids or tags");
   }
-  const mutating = Boolean(inputs.envFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
-  if (mutating && (uuids.length !== 1 || tags.length > 0)) {
+  const mutatingRequested = Boolean(inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag ||
+    Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
+  if (mutatingRequested && (uuids.length !== 1 || tags.length > 0)) {
     throw new Error("Environment and configuration updates require exactly one resource UUID");
   }
+  const { entries: envs, sopsToken } = await environmentSources(inputs, deps);
+  const mutating = Boolean(envs.length || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
   const force = boolean(inputs.force, "force");
   const wait = boolean(inputs.wait, "wait");
   const timeout = positiveInteger(inputs.timeoutSeconds, "timeout-seconds", 86_400) * 1_000;
@@ -299,18 +369,17 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   }
   if (inputs.imageTag && !inputs.imageName) throw new Error("image-name is required with image-tag");
   if (inputs.imageName && !inputs.imageTag) throw new Error("image-tag is required with image-name");
-  if (mutating && !inputs.writeToken) throw new Error("write-token is required for configuration updates");
-  const readToken = inputs.readToken || inputs.writeToken;
+  const writeToken = inputs.writeToken || sopsToken;
+  const readToken = inputs.readToken || writeToken;
+  if (mutating && !writeToken) throw new Error("write-token is required for configuration updates");
   if (wait && !readToken) throw new Error("read-token is required when wait is true");
-  const token = required(inputs.deployToken, "deploy-token");
+  const token = required(inputs.deployToken || sopsToken, "deploy-token");
   const client = new Coolify(baseUrl(inputs.url), deps);
 
   if (mutating) {
     const uuid = uuids[0]!;
     const kind = await resourceType(inputs.resourceType, uuid, client, readToken);
     const path = `${kind}s/${uuid}`;
-    let envs: JsonRecord[] | undefined;
-    if (inputs.envFile) envs = environment(await jsonFile(inputs.envFile, "Environment", deps));
     const managed = new Set(csv(inputs.pruneEnvKeys));
     for (const key of managed) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid managed environment key ${key}`);
@@ -333,23 +402,23 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
       }
       patch.docker_registry_image_tag = imageTag(inputs.imageTag);
     }
-    if (envs && envs.length > 0) {
-      await client.expect("PATCH", `${path}/envs/bulk`, inputs.writeToken, { data: envs });
+    if (envs.length > 0) {
+      await client.expect("PATCH", `${path}/envs/bulk`, writeToken, { data: envs });
       deps.log(`Updated ${envs.length} environment variables for ${kind} ${uuid}`);
     }
     if (managed.size > 0 && Array.isArray(existing)) {
-      const desired = new Set((envs ?? []).filter((entry) => entry.is_preview !== true).map((entry) => entry.key as string));
+      const desired = new Set(envs.filter((entry) => entry.is_preview !== true).map((entry) => entry.key as string));
       for (const value of existing) {
         const entry = record(value, "Existing environment variable");
         if (typeof entry.key !== "string" || !managed.has(entry.key) || desired.has(entry.key) || entry.is_preview === true) continue;
         if (typeof entry.uuid !== "string") throw new Error(`Environment variable ${entry.key} has no UUID`);
-        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`, inputs.writeToken);
+        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`, writeToken);
         deps.log(`Removed managed environment variable ${entry.key}`);
       }
     }
 
     if (Object.keys(patch).length > 0) {
-      await client.expect("PATCH", path, inputs.writeToken, patch);
+      await client.expect("PATCH", path, writeToken, patch);
       deps.log(`Updated ${kind} configuration for ${uuid}`);
     }
   }

@@ -6,11 +6,76 @@ import { appendFileSync } from "node:fs";
 
 // coolify-deploy/src/core.ts
 import { readFile } from "node:fs/promises";
+
+// coolify-deploy/src/sops.ts
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+var run = promisify(execFile);
+var version = "3.13.3";
+var checksums = {
+  "linux.amd64": "e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b",
+  "linux.arm64": "53b0abacd38ef1b12a66d6c100956691b9cefce018d91f81e73ddf7438b94d77",
+  "darwin.amd64": "42162d5cef10b74fcf80a045a70e658d7ce6e63d6ea1be6f347e44015714468d",
+  "darwin.arm64": "b97c0d434aab577dc40310e8d22ff9e45eef4c80638ab978daae9b4681c59286"
+};
+async function decryptSops(path, ageKey) {
+  const arch = process.arch === "x64" ? "amd64" : process.arch === "arm64" ? "arm64" : "";
+  const platform = `${process.platform}.${arch}`;
+  const expected = checksums[platform];
+  if (!expected)
+    throw new Error("SOPS decryption is supported on Linux and macOS x64/arm64 runners");
+  const directory = await mkdtemp(join(tmpdir(), "coolify-sops-"));
+  try {
+    const filename = `sops-v${version}.${platform}`;
+    let binary;
+    try {
+      const response = await fetch(`https://github.com/getsops/sops/releases/download/v${version}/${filename}`, {
+        signal: AbortSignal.timeout(60000)
+      });
+      if (!response.ok)
+        throw new Error("Download failed");
+      binary = Buffer.from(await response.arrayBuffer());
+    } catch {
+      throw new Error(`Could not download SOPS v${version}`);
+    }
+    if (createHash("sha256").update(binary).digest("hex") !== expected) {
+      throw new Error("SOPS binary checksum verification failed");
+    }
+    const executable = join(directory, "sops");
+    await writeFile(executable, binary, { mode: 448 });
+    let stdout;
+    try {
+      ({ stdout } = await run(executable, ["decrypt", "--output-type", "json", path], {
+        env: { ...process.env, SOPS_AGE_KEY: ageKey },
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 120000
+      }));
+    } catch {
+      throw new Error("Could not decrypt SOPS file; check its path and AGE key");
+    }
+    try {
+      return JSON.parse(stdout);
+    } catch {
+      throw new Error("Decrypted SOPS file must contain valid JSON");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+// coolify-deploy/src/core.ts
 var defaultDependencies = {
   fetch,
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   now: Date.now,
   readFile: (path) => readFile(path, "utf8"),
+  environmentVariables: process.env,
+  decryptSops,
+  mask: (value) => console.log(`::add-mask::${value.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")}`),
   log: console.log,
   onAccepted: () => {}
 };
@@ -128,6 +193,66 @@ function environment(value) {
     return { ...defaults, ...item };
   });
 }
+async function environmentSources(inputs, deps) {
+  const prefix = required(inputs.envPrefix, "env-prefix");
+  if (!/^[A-Za-z_][A-Za-z0-9_]*_$/.test(prefix)) {
+    throw new Error("env-prefix must be an environment variable prefix ending in underscore");
+  }
+  const sources = [];
+  if (inputs.envFile)
+    sources.push(["env-file", environment(await jsonFile(inputs.envFile, "Environment", deps))]);
+  const prefixed = {};
+  for (const [name, value] of Object.entries(deps.environmentVariables)) {
+    if (name.startsWith(prefix) && value !== undefined)
+      prefixed[name.slice(prefix.length)] = value;
+  }
+  if (Object.keys(prefixed).length > 0)
+    sources.push(["step env", environment(prefixed)]);
+  let sopsToken = "";
+  if (inputs.sopsFile) {
+    const decrypted = record(await deps.decryptSops(inputs.sopsFile, required(inputs.sopsAgeKey, "sops-age-key")), "SOPS file");
+    const tokenKey = required(inputs.sopsTokenKey, "sops-token-key");
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenKey))
+      throw new Error("sops-token-key is invalid");
+    const candidate = decrypted[tokenKey];
+    if (candidate !== undefined && typeof candidate !== "string")
+      throw new Error("SOPS token must be a string");
+    sopsToken = candidate ?? "";
+    const included = csv(inputs.sopsEnvKeys);
+    for (const key of included) {
+      if (key === tokenKey || !(key in decrypted))
+        throw new Error(`sops-env-keys contains unavailable environment key ${key}`);
+    }
+    const entries2 = Object.fromEntries(Object.entries(decrypted).filter(([key]) => key !== tokenKey && (included.length === 0 || included.includes(key))));
+    sources.push(["sops-file", environment(entries2)]);
+  } else if (inputs.sopsAgeKey || inputs.sopsEnvKeys) {
+    throw new Error("sops-age-key and sops-env-keys require sops-file");
+  }
+  const seen = new Map;
+  const entries = [];
+  for (const [source, values] of sources) {
+    for (const entry of values) {
+      const key = entry.key;
+      const previous = seen.get(key);
+      if (previous)
+        throw new Error(`Environment key ${key} appears in both ${previous} and ${source}`);
+      seen.set(key, source);
+      entries.push(entry);
+      if (entry.value)
+        deps.mask(entry.value);
+    }
+  }
+  if (sopsToken)
+    deps.mask(sopsToken);
+  for (const key of csv(inputs.requiredEnvKeys)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
+      throw new Error(`Invalid required environment key ${key}`);
+    if (!entries.some((entry) => entry.key === key && Boolean(entry.value))) {
+      throw new Error(`Required environment variable ${key} is missing or empty`);
+    }
+  }
+  return { entries, sopsToken };
+}
 function pathPart(value, name) {
   if (!/^[A-Za-z0-9_-]+$/.test(value))
     throw new Error(`${name} contains an invalid identifier`);
@@ -228,10 +353,12 @@ async function deploy(inputs, deps = defaultDependencies) {
   if (uuids.length > 0 === tags.length > 0) {
     throw new Error("Set exactly one of uuids or tags");
   }
-  const mutating = Boolean(inputs.envFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
-  if (mutating && (uuids.length !== 1 || tags.length > 0)) {
+  const mutatingRequested = Boolean(inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag || Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
+  if (mutatingRequested && (uuids.length !== 1 || tags.length > 0)) {
     throw new Error("Environment and configuration updates require exactly one resource UUID");
   }
+  const { entries: envs, sopsToken } = await environmentSources(inputs, deps);
+  const mutating = Boolean(envs.length || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
   const force = boolean(inputs.force, "force");
   const wait = boolean(inputs.wait, "wait");
   const timeout = positiveInteger(inputs.timeoutSeconds, "timeout-seconds", 86400) * 1000;
@@ -265,20 +392,18 @@ async function deploy(inputs, deps = defaultDependencies) {
     throw new Error("image-name is required with image-tag");
   if (inputs.imageName && !inputs.imageTag)
     throw new Error("image-tag is required with image-name");
-  if (mutating && !inputs.writeToken)
+  const writeToken = inputs.writeToken || sopsToken;
+  const readToken = inputs.readToken || writeToken;
+  if (mutating && !writeToken)
     throw new Error("write-token is required for configuration updates");
-  const readToken = inputs.readToken || inputs.writeToken;
   if (wait && !readToken)
     throw new Error("read-token is required when wait is true");
-  const token = required(inputs.deployToken, "deploy-token");
+  const token = required(inputs.deployToken || sopsToken, "deploy-token");
   const client = new Coolify(baseUrl(inputs.url), deps);
   if (mutating) {
     const uuid = uuids[0];
     const kind = await resourceType(inputs.resourceType, uuid, client, readToken);
     const path = `${kind}s/${uuid}`;
-    let envs;
-    if (inputs.envFile)
-      envs = environment(await jsonFile(inputs.envFile, "Environment", deps));
     const managed = new Set(csv(inputs.pruneEnvKeys));
     for (const key of managed) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
@@ -301,24 +426,24 @@ async function deploy(inputs, deps = defaultDependencies) {
       }
       patch.docker_registry_image_tag = imageTag(inputs.imageTag);
     }
-    if (envs && envs.length > 0) {
-      await client.expect("PATCH", `${path}/envs/bulk`, inputs.writeToken, { data: envs });
+    if (envs.length > 0) {
+      await client.expect("PATCH", `${path}/envs/bulk`, writeToken, { data: envs });
       deps.log(`Updated ${envs.length} environment variables for ${kind} ${uuid}`);
     }
     if (managed.size > 0 && Array.isArray(existing)) {
-      const desired = new Set((envs ?? []).filter((entry) => entry.is_preview !== true).map((entry) => entry.key));
+      const desired = new Set(envs.filter((entry) => entry.is_preview !== true).map((entry) => entry.key));
       for (const value of existing) {
         const entry = record(value, "Existing environment variable");
         if (typeof entry.key !== "string" || !managed.has(entry.key) || desired.has(entry.key) || entry.is_preview === true)
           continue;
         if (typeof entry.uuid !== "string")
           throw new Error(`Environment variable ${entry.key} has no UUID`);
-        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`, inputs.writeToken);
+        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`, writeToken);
         deps.log(`Removed managed environment variable ${entry.key}`);
       }
     }
     if (Object.keys(patch).length > 0) {
-      await client.expect("PATCH", path, inputs.writeToken, patch);
+      await client.expect("PATCH", path, writeToken, patch);
       deps.log(`Updated ${kind} configuration for ${uuid}`);
     }
   }
@@ -411,6 +536,12 @@ var inputs = {
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
   envFile: input("env-file"),
+  envPrefix: input("env-prefix", "COOLIFY_ENV_"),
+  requiredEnvKeys: input("required-env-keys"),
+  sopsFile: input("sops-file"),
+  sopsAgeKey: input("sops-age-key"),
+  sopsTokenKey: input("sops-token-key", "COOLIFY_API_TOKEN"),
+  sopsEnvKeys: input("sops-env-keys"),
   pruneEnvKeys: input("prune-env-keys"),
   patchFile: input("patch-file"),
   imageName: input("image-name"),
@@ -431,6 +562,9 @@ try {
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     now: Date.now,
     readFile: async (path) => (await import("node:fs/promises")).readFile(path, "utf8"),
+    environmentVariables: process.env,
+    decryptSops,
+    mask: (value) => console.log(`::add-mask::${value.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")}`),
     log: console.log,
     onAccepted: accepted
   });

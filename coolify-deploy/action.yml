@@ -7,8 +7,8 @@ inputs:
     description: Coolify base URL, with or without /api/v1
     required: true
   deploy-token:
-    description: Coolify token with deploy permission
-    required: true
+    description: Coolify token with deploy permission; may come from sops-token-key instead
+    required: false
   read-token:
     description: Coolify token with read permission; required to wait, detect resource type, or verify an image
     required: false
@@ -26,6 +26,24 @@ inputs:
     default: auto
   env-file:
     description: Path to a JSON object or array of environment variables; values are never logged
+    required: false
+  env-prefix:
+    description: Step environment variables with this prefix are synced to Coolify after removing the prefix
+    default: COOLIFY_ENV_
+  required-env-keys:
+    description: Comma-separated environment keys that must be present and nonempty before any Coolify request
+    required: false
+  sops-file:
+    description: Path to a SOPS-encrypted JSON object of environment variables
+    required: false
+  sops-age-key:
+    description: AGE private key used to decrypt sops-file; supply from a GitHub secret
+    required: false
+  sops-token-key:
+    description: Key in the decrypted SOPS object used as fallback for Coolify API tokens, excluded from runtime variables
+    default: COOLIFY_API_TOKEN
+  sops-env-keys:
+    description: Optional comma-separated allowlist of SOPS keys to sync; defaults to all except sops-token-key
     required: false
   prune-env-keys:
     description: Comma-separated environment keys managed by this action; missing keys are removed

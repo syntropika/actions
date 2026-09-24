@@ -11,6 +11,12 @@ function inputs(overrides: Partial<Inputs> = {}): Inputs {
     tags: "",
     resourceType: "application",
     envFile: "",
+    envPrefix: "COOLIFY_ENV_",
+    requiredEnvKeys: "",
+    sopsFile: "",
+    sopsAgeKey: "",
+    sopsTokenKey: "COOLIFY_API_TOKEN",
+    sopsEnvKeys: "",
     pruneEnvKeys: "",
     patchFile: "",
     imageName: "",
@@ -28,10 +34,16 @@ function inputs(overrides: Partial<Inputs> = {}): Inputs {
   };
 }
 
-function fixture(responses: Array<[number, unknown]>, files: Record<string, string> = {}) {
+function fixture(
+  responses: Array<[number, unknown]>,
+  files: Record<string, string> = {},
+  environmentVariables: NodeJS.ProcessEnv = {},
+  decrypted: unknown = {},
+) {
   const calls: Array<{ method: string; url: string; token: string; body: unknown }> = [];
   const logs: string[] = [];
   const accepted: unknown[] = [];
+  const masked: string[] = [];
   const deps: Dependencies = {
     fetch: (async (url: URL | RequestInfo, init?: RequestInit) => {
       const [status, payload] = responses.shift() ?? [500, { message: "Unexpected request" }];
@@ -52,10 +64,13 @@ function fixture(responses: Array<[number, unknown]>, files: Record<string, stri
       if (!(path in files)) throw new Error("Missing fixture file");
       return files[path]!;
     },
+    environmentVariables,
+    decryptSops: async () => decrypted,
+    mask: (value) => masked.push(value),
     log: (message) => logs.push(message),
     onAccepted: (deployments) => accepted.push(deployments),
   };
-  return { deps, calls, logs, accepted };
+  return { deps, calls, logs, accepted, masked };
 }
 
 describe("Coolify deployment", () => {
@@ -192,5 +207,62 @@ describe("Coolify deployment", () => {
     expect(f.calls[2]?.url).toBe("https://app.example/ready");
     expect(f.calls[2]?.token).toBe("null");
     expect(f.logs).toContain("Health check passed");
+  });
+
+  test("syncs prefixed step variables and validates required secrets before any API call", async () => {
+    const f = fixture([
+      [201, []],
+      [200, { deployments: [{ resource_uuid: "resource123" }] }],
+    ], {}, { COOLIFY_ENV_API_KEY: "from-github", COOLIFY_ENV_OPTIONAL: "", UNRELATED: "ignored" });
+    const result = await deploy(inputs({ requiredEnvKeys: "API_KEY", wait: "false" }), f.deps);
+    expect(result.status).toBe("accepted");
+    expect(f.calls[0]?.body).toEqual({ data: [
+      { key: "API_KEY", value: "from-github", is_runtime: true, is_buildtime: false, is_preview: false, is_literal: true, is_shown_once: true },
+      { key: "OPTIONAL", value: "", is_runtime: true, is_buildtime: false, is_preview: false, is_literal: true, is_shown_once: true },
+    ] });
+    expect(f.masked).toContain("from-github");
+    expect(JSON.stringify(f.logs)).not.toContain("from-github");
+
+    const missing = fixture([], {}, { COOLIFY_ENV_API_KEY: "" });
+    await expect(deploy(inputs({ requiredEnvKeys: "API_KEY" }), missing.deps))
+      .rejects.toThrow("Required environment variable API_KEY is missing or empty");
+    expect(missing.calls).toHaveLength(0);
+  });
+
+  test("decrypts SOPS data, uses its API token, and syncs only allowed runtime keys", async () => {
+    const f = fixture([
+      [201, []],
+      [200, { deployments: [{ resource_uuid: "resource123" }] }],
+    ], {}, { COOLIFY_ENV_PUBLIC_SETTING: "enabled" }, {
+      COOLIFY_API_TOKEN: "sops-token",
+      DATABASE_URL: "postgres://secret",
+      DO_NOT_SYNC: "excluded",
+    });
+    const result = await deploy(inputs({
+      sopsFile: "deployment/prod.sops.json",
+      sopsAgeKey: "age-secret",
+      sopsEnvKeys: "DATABASE_URL",
+      deployToken: "", readToken: "", writeToken: "", wait: "false",
+    }), f.deps);
+    expect(result.status).toBe("accepted");
+    expect(f.calls.map((call) => call.token)).toEqual(["Bearer sops-token", "Bearer sops-token"]);
+    expect(f.calls[0]?.body).toEqual({ data: [
+      { key: "PUBLIC_SETTING", value: "enabled", is_runtime: true, is_buildtime: false, is_preview: false, is_literal: true, is_shown_once: true },
+      { key: "DATABASE_URL", value: "postgres://secret", is_runtime: true, is_buildtime: false, is_preview: false, is_literal: true, is_shown_once: true },
+    ] });
+    expect(f.masked).toContain("sops-token");
+    expect(JSON.stringify(f.logs)).not.toContain("postgres://secret");
+  });
+
+  test("rejects duplicate environment sources and missing SOPS keys before API calls", async () => {
+    const f = fixture([], { "/tmp/env.json": JSON.stringify({ API_KEY: "file-secret" }) },
+      { COOLIFY_ENV_API_KEY: "step-secret" });
+    await expect(deploy(inputs({ envFile: "/tmp/env.json" }), f.deps)).rejects.toThrow("appears in both");
+    expect(f.calls).toHaveLength(0);
+
+    const sops = fixture([], {}, {}, { COOLIFY_API_TOKEN: "token" });
+    await expect(deploy(inputs({ sopsFile: "secrets.sops.json", sopsAgeKey: "age-secret", sopsEnvKeys: "MISSING" }), sops.deps))
+      .rejects.toThrow("unavailable environment key MISSING");
+    expect(sops.calls).toHaveLength(0);
   });
 });

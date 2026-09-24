@@ -1,5 +1,6 @@
 import { appendFileSync } from "node:fs";
 import { deploy, type Deployment, type Inputs } from "./core.ts";
+import { decryptSops } from "./sops.ts";
 
 function input(name: string, fallback = ""): string {
   return process.env[`INPUT_${name.toUpperCase()}`] ?? fallback;
@@ -25,6 +26,12 @@ const inputs: Inputs = {
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
   envFile: input("env-file"),
+  envPrefix: input("env-prefix", "COOLIFY_ENV_"),
+  requiredEnvKeys: input("required-env-keys"),
+  sopsFile: input("sops-file"),
+  sopsAgeKey: input("sops-age-key"),
+  sopsTokenKey: input("sops-token-key", "COOLIFY_API_TOKEN"),
+  sopsEnvKeys: input("sops-env-keys"),
   pruneEnvKeys: input("prune-env-keys"),
   patchFile: input("patch-file"),
   imageName: input("image-name"),
@@ -46,6 +53,9 @@ try {
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     now: Date.now,
     readFile: async (path) => (await import("node:fs/promises")).readFile(path, "utf8"),
+    environmentVariables: process.env,
+    decryptSops,
+    mask: (value) => console.log(`::add-mask::${value.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")}`),
     log: console.log,
     onAccepted: accepted,
   });
