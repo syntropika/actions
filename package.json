@@ -1,0 +1,15 @@
+{
+  "name": "@syntropika/actions",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build ./coolify-deploy/src/main.ts --target=node --outfile ./coolify-deploy/dist/main.js",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test && bun run build && git diff --exit-code -- coolify-deploy/dist/main.js"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2"
+  }
+}

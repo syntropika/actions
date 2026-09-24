@@ -1,0 +1,84 @@
+name: Coolify Deploy
+description: Configure a Coolify resource and deploy it by UUID or tag
+author: Syntropika
+
+inputs:
+  url:
+    description: Coolify base URL, with or without /api/v1
+    required: true
+  deploy-token:
+    description: Coolify token with deploy permission
+    required: true
+  read-token:
+    description: Coolify token with read permission; required to wait, detect resource type, or verify an image
+    required: false
+  write-token:
+    description: Coolify token with write permission; required to update environment variables or resource configuration
+    required: false
+  uuids:
+    description: One or more resource UUIDs, separated by commas
+    required: false
+  tags:
+    description: One or more Coolify resource tags, separated by commas; exclusive with uuids
+    required: false
+  resource-type:
+    description: application, service, or auto for resource configuration and environment updates
+    default: auto
+  env-file:
+    description: Path to a JSON object or array of environment variables; values are never logged
+    required: false
+  prune-env-keys:
+    description: Comma-separated environment keys managed by this action; missing keys are removed
+    required: false
+  patch-file:
+    description: Path to a JSON object with application or service fields to update before deployment
+    required: false
+  image-name:
+    description: Expected Docker Image repository, required when image-tag is set
+    required: false
+  image-tag:
+    description: Docker Image tag or sha256 digest to select before deployment
+    required: false
+  force:
+    description: Force a rebuild without cache
+    default: 'false'
+  pull-request-id:
+    description: Pull request identifier for a Coolify preview deployment
+    required: false
+  docker-tag:
+    description: Docker tag override for a Docker Image preview; requires pull-request-id
+    required: false
+  wait:
+    description: Wait for deployment queue entries to finish; requires a read token
+    default: 'true'
+  timeout-seconds:
+    description: Maximum time to wait for all deployments
+    default: '1200'
+  poll-interval-seconds:
+    description: Time between deployment status checks
+    default: '10'
+  health-url:
+    description: Optional HTTPS URL to check after the deployment finishes
+    required: false
+  health-status:
+    description: Expected HTTP status from the health URL
+    default: '200'
+  health-timeout-seconds:
+    description: Maximum time to wait for the health URL after deployment
+    default: '360'
+
+outputs:
+  deployments:
+    description: JSON array of deployments returned by Coolify
+  deployment-uuids:
+    description: Comma-separated deployment UUIDs returned by Coolify
+  status:
+    description: finished, accepted, or partially-observed
+
+runs:
+  using: node24
+  main: dist/main.js
+
+branding:
+  icon: upload-cloud
+  color: blue
