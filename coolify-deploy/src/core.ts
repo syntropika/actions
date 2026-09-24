@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { decryptSops } from "./sops.ts";
+import { applicationSpec, resolveApplication, syncPersistentStorages } from "./application.ts";
 
 type ResourceType = "application" | "service";
 type JsonRecord = Record<string, unknown>;
@@ -12,6 +13,7 @@ export interface Inputs {
   uuids: string;
   tags: string;
   resourceType: string;
+  applicationFile: string;
   envFile: string;
   envPrefix: string;
   requiredEnvKeys: string;
@@ -330,16 +332,19 @@ async function resourceType(
 export async function deploy(inputs: Inputs, deps: Dependencies = defaultDependencies): Promise<Result> {
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
-  if ((uuids.length > 0) === (tags.length > 0)) {
-    throw new Error("Set exactly one of uuids or tags");
+  const application = inputs.applicationFile
+    ? applicationSpec(await jsonFile(inputs.applicationFile, "Application", deps))
+    : undefined;
+  if (Number(uuids.length > 0) + Number(tags.length > 0) + Number(Boolean(application)) !== 1) {
+    throw new Error("Set exactly one of uuids, tags, or application-file");
   }
-  const mutatingRequested = Boolean(inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag ||
+  const mutatingRequested = Boolean(application || inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag ||
     Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
-  if (mutatingRequested && (uuids.length !== 1 || tags.length > 0)) {
-    throw new Error("Environment and configuration updates require exactly one resource UUID");
+  if (mutatingRequested && !application && (uuids.length !== 1 || tags.length > 0)) {
+    throw new Error("Environment and configuration updates require exactly one resource UUID or application-file");
   }
   const { entries: envs, sopsToken } = await environmentSources(inputs, deps);
-  const mutating = Boolean(envs.length || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
+  const mutating = Boolean(application || envs.length || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
   const force = boolean(inputs.force, "force");
   const wait = boolean(inputs.wait, "wait");
   const timeout = positiveInteger(inputs.timeoutSeconds, "timeout-seconds", 86_400) * 1_000;
@@ -369,6 +374,7 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   }
   if (inputs.imageTag && !inputs.imageName) throw new Error("image-name is required with image-tag");
   if (inputs.imageName && !inputs.imageTag) throw new Error("image-tag is required with image-name");
+  if (application && !inputs.imageTag) throw new Error("application-file requires image-name and image-tag");
   const writeToken = inputs.writeToken || sopsToken;
   const readToken = inputs.readToken || writeToken;
   if (mutating && !writeToken) throw new Error("write-token is required for configuration updates");
@@ -376,9 +382,16 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   const token = required(inputs.deployToken || sopsToken, "deploy-token");
   const client = new Coolify(baseUrl(inputs.url), deps);
 
+  if (application) {
+    const target = await resolveApplication(application, inputs.imageName, imageTag(inputs.imageTag), client, readToken, writeToken);
+    uuids.push(target.uuid);
+    deps.log(`${target.created ? "Created" : "Found"} application ${application.slug}: ${target.uuid}`);
+    await syncPersistentStorages(application, target.uuid, target.created, client, readToken, writeToken, deps.log);
+  }
+
   if (mutating) {
     const uuid = uuids[0]!;
-    const kind = await resourceType(inputs.resourceType, uuid, client, readToken);
+    const kind = application ? "application" : await resourceType(inputs.resourceType, uuid, client, readToken);
     const path = `${kind}s/${uuid}`;
     const managed = new Set(csv(inputs.pruneEnvKeys));
     for (const key of managed) {
@@ -388,9 +401,14 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
     if (existing !== undefined && !Array.isArray(existing)) {
       throw new Error("Coolify returned an invalid environment list");
     }
-    const patch: JsonRecord = inputs.patchFile
+    const filePatch: JsonRecord = inputs.patchFile
       ? record(await jsonFile(inputs.patchFile, "Patch", deps), "Patch file")
       : {};
+    const patch: JsonRecord = { ...application?.update };
+    for (const [key, value] of Object.entries(filePatch)) {
+      if (key in patch) throw new Error(`Patch field ${key} appears in both application-file and patch-file`);
+      patch[key] = value;
+    }
     if (inputs.imageTag) {
       if (kind !== "application") throw new Error("image-tag requires an application");
       const application = record(await client.expect("GET", path, readToken), "Application response");

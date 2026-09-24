@@ -16,10 +16,13 @@ inputs:
     description: Coolify token with write permission; required to update environment variables or resource configuration
     required: false
   uuids:
-    description: One or more resource UUIDs, separated by commas
+    description: One or more resource UUIDs, separated by commas; exclusive with tags and application-file
     required: false
   tags:
-    description: One or more Coolify resource tags, separated by commas; exclusive with uuids
+    description: One or more Coolify resource tags, separated by commas; exclusive with uuids and application-file
+    required: false
+  application-file:
+    description: JSON specification that finds a Docker Image application by slug in a project/environment or creates it if missing
     required: false
   resource-type:
     description: application, service, or auto for resource configuration and environment updates

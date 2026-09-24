@@ -25,6 +25,7 @@ const inputs: Inputs = {
   uuids: input("uuids"),
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
+  applicationFile: input("application-file"),
   envFile: input("env-file"),
   envPrefix: input("env-prefix", "COOLIFY_ENV_"),
   requiredEnvKeys: input("required-env-keys"),

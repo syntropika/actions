@@ -67,6 +67,158 @@ async function decryptSops(path, ageKey) {
   }
 }
 
+// coolify-deploy/src/application.ts
+function object(value, context) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${context} must be a JSON object`);
+  }
+  return value;
+}
+function list(value, context) {
+  if (!Array.isArray(value))
+    throw new Error(`${context} must be a JSON array`);
+  return value.map((entry, index) => object(entry, `${context} entry ${index + 1}`));
+}
+function string(value, context) {
+  if (typeof value !== "string" || !value.trim())
+    throw new Error(`${context} must be a nonempty string`);
+  return value.trim();
+}
+function identifier(value, context) {
+  const result = string(value, context);
+  if (!/^[A-Za-z0-9_-]+$/.test(result))
+    throw new Error(`${context} contains an invalid identifier`);
+  return result;
+}
+function options(value, context, forbidden) {
+  if (value === undefined)
+    return {};
+  const result = object(value, context);
+  for (const key of forbidden) {
+    if (key in result)
+      throw new Error(`${context} must not set ${key}`);
+  }
+  return result;
+}
+function applicationSpec(value) {
+  const input = object(value, "Application file");
+  const allowed = new Set(["slug", "project", "server", "environment", "create_if_missing", "create", "update", "storages"]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key))
+      throw new Error(`Application file has unsupported field ${key}`);
+  }
+  const slug = string(input.slug, "Application slug");
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)) {
+    throw new Error("Application slug must use lowercase letters, digits, and hyphens (maximum 63 characters)");
+  }
+  const createIfMissing = input.create_if_missing ?? true;
+  if (typeof createIfMissing !== "boolean")
+    throw new Error("create_if_missing must be true or false");
+  const reserved = ["project_uuid", "server_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
+  const create = options(input.create, "Application create options", reserved);
+  const update = options(input.update, "Application update options", [...reserved, "build_pack"]);
+  const storages = input.storages === undefined ? [] : list(input.storages, "Application storages").map((entry, index) => {
+    for (const key of Object.keys(entry)) {
+      if (key !== "name" && key !== "mount_path")
+        throw new Error(`Storage ${index + 1} has unsupported field ${key}`);
+    }
+    const name = string(entry.name, `Storage ${index + 1} name`);
+    const mount_path = string(entry.mount_path, `Storage ${index + 1} mount_path`);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name))
+      throw new Error(`Storage ${index + 1} has an invalid volume name`);
+    if (!mount_path.startsWith("/") || mount_path.includes(".."))
+      throw new Error(`Storage ${index + 1} mount_path must be an absolute container path`);
+    return { name, mount_path };
+  });
+  const names = new Set;
+  const paths = new Set;
+  for (const storage of storages) {
+    if (names.has(storage.name) || paths.has(storage.mount_path))
+      throw new Error("Application storages contain duplicate names or mount paths");
+    names.add(storage.name);
+    paths.add(storage.mount_path);
+  }
+  return {
+    slug,
+    project: input.project === undefined ? "" : string(input.project, "Application project"),
+    server: input.server === undefined ? "" : string(input.server, "Application server"),
+    environment: input.environment === undefined ? "production" : string(input.environment, "Application environment"),
+    create_if_missing: createIfMissing,
+    create,
+    update,
+    storages
+  };
+}
+function select(items, selector, context) {
+  const matches = selector ? items.filter((item) => item.name === selector || item.uuid === selector) : items;
+  if (matches.length !== 1) {
+    throw new Error(selector ? `Expected exactly one ${context} named ${selector}; found ${matches.length}` : `Specify ${context} because Coolify returned ${items.length} candidates`);
+  }
+  return matches[0];
+}
+async function resolveApplication(spec, imageName, imageTag, api, readToken, writeToken) {
+  const projects = list(await api.expect("GET", "projects", readToken), "Coolify projects");
+  const project = select(projects, spec.project, "project");
+  const projectUuid = identifier(project.uuid, "Project UUID");
+  const environments = list(await api.expect("GET", `projects/${projectUuid}/environments`, readToken), "Coolify environments");
+  const environment = select(environments, spec.environment, "environment");
+  if (typeof environment.id !== "number")
+    throw new Error("Coolify environment has no numeric ID");
+  const servers = list(await api.expect("GET", "servers", readToken), "Coolify servers");
+  const server = select(servers, spec.server, "server");
+  const serverUuid = identifier(server.uuid, "Server UUID");
+  const applications = list(await api.expect("GET", "applications", readToken), "Coolify applications");
+  const candidates = applications.filter((item) => item.name === spec.slug && item.environment_id === environment.id);
+  const matches = [];
+  for (const candidate of candidates) {
+    const uuid = identifier(candidate.uuid, "Application UUID");
+    const destinations = list(await api.expect("GET", `applications/${uuid}/destinations`, readToken), "Application destinations");
+    const primary = destinations.filter((destination) => destination.is_primary === true);
+    if (primary.length !== 1 || typeof primary[0]?.server_uuid !== "string") {
+      throw new Error(`Application ${uuid} has no identifiable primary server`);
+    }
+    if (primary[0].server_uuid === serverUuid)
+      matches.push(candidate);
+  }
+  if (matches.length > 1)
+    throw new Error(`Application slug ${spec.slug} is ambiguous in environment ${spec.environment}`);
+  if (matches.length === 1) {
+    const application = matches[0];
+    if (application.build_pack !== "dockerimage" || application.docker_registry_image_name !== imageName) {
+      throw new Error(`Application slug ${spec.slug} exists but is not the expected Docker Image application`);
+    }
+    return { uuid: identifier(application.uuid, "Application UUID"), created: false };
+  }
+  if (!spec.create_if_missing)
+    throw new Error(`Application slug ${spec.slug} was not found`);
+  const created = object(await api.expect("POST", "applications/dockerimage", writeToken, {
+    ...spec.create,
+    project_uuid: projectUuid,
+    server_uuid: serverUuid,
+    environment_name: spec.environment,
+    name: spec.slug,
+    docker_registry_image_name: imageName,
+    docker_registry_image_tag: imageTag,
+    instant_deploy: false
+  }), "Created application");
+  return { uuid: identifier(created.uuid, "Created application UUID"), created: true };
+}
+async function syncPersistentStorages(spec, uuid, created, api, readToken, writeToken, log) {
+  if (spec.storages.length === 0)
+    return;
+  const existing = created ? [] : list(object(await api.expect("GET", `applications/${uuid}/storages`, readToken), "Coolify storages").persistent_storages, "Coolify persistent storages");
+  for (const storage of spec.storages) {
+    const matching = existing.filter((entry) => entry.name === storage.name || entry.mount_path === storage.mount_path);
+    if (matching.length > 1 || matching.some((entry) => entry.name !== storage.name || entry.mount_path !== storage.mount_path)) {
+      throw new Error(`Persistent storage ${storage.name} conflicts with an existing storage`);
+    }
+    if (matching.length === 0) {
+      await api.expect("POST", `applications/${uuid}/storages`, writeToken, { type: "persistent", ...storage });
+      log(`Created persistent storage ${storage.name} for application ${uuid}`);
+    }
+  }
+}
+
 // coolify-deploy/src/core.ts
 var defaultDependencies = {
   fetch,
@@ -350,15 +502,16 @@ async function resourceType(requested, uuid, client, readToken) {
 async function deploy(inputs, deps = defaultDependencies) {
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
-  if (uuids.length > 0 === tags.length > 0) {
-    throw new Error("Set exactly one of uuids or tags");
+  const application = inputs.applicationFile ? applicationSpec(await jsonFile(inputs.applicationFile, "Application", deps)) : undefined;
+  if (Number(uuids.length > 0) + Number(tags.length > 0) + Number(Boolean(application)) !== 1) {
+    throw new Error("Set exactly one of uuids, tags, or application-file");
   }
-  const mutatingRequested = Boolean(inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag || Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
-  if (mutatingRequested && (uuids.length !== 1 || tags.length > 0)) {
-    throw new Error("Environment and configuration updates require exactly one resource UUID");
+  const mutatingRequested = Boolean(application || inputs.envFile || inputs.sopsFile || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag || Object.keys(deps.environmentVariables).some((name) => name.startsWith(inputs.envPrefix)));
+  if (mutatingRequested && !application && (uuids.length !== 1 || tags.length > 0)) {
+    throw new Error("Environment and configuration updates require exactly one resource UUID or application-file");
   }
   const { entries: envs, sopsToken } = await environmentSources(inputs, deps);
-  const mutating = Boolean(envs.length || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
+  const mutating = Boolean(application || envs.length || inputs.pruneEnvKeys || inputs.patchFile || inputs.imageTag);
   const force = boolean(inputs.force, "force");
   const wait = boolean(inputs.wait, "wait");
   const timeout = positiveInteger(inputs.timeoutSeconds, "timeout-seconds", 86400) * 1000;
@@ -392,6 +545,8 @@ async function deploy(inputs, deps = defaultDependencies) {
     throw new Error("image-name is required with image-tag");
   if (inputs.imageName && !inputs.imageTag)
     throw new Error("image-tag is required with image-name");
+  if (application && !inputs.imageTag)
+    throw new Error("application-file requires image-name and image-tag");
   const writeToken = inputs.writeToken || sopsToken;
   const readToken = inputs.readToken || writeToken;
   if (mutating && !writeToken)
@@ -400,9 +555,15 @@ async function deploy(inputs, deps = defaultDependencies) {
     throw new Error("read-token is required when wait is true");
   const token = required(inputs.deployToken || sopsToken, "deploy-token");
   const client = new Coolify(baseUrl(inputs.url), deps);
+  if (application) {
+    const target = await resolveApplication(application, inputs.imageName, imageTag(inputs.imageTag), client, readToken, writeToken);
+    uuids.push(target.uuid);
+    deps.log(`${target.created ? "Created" : "Found"} application ${application.slug}: ${target.uuid}`);
+    await syncPersistentStorages(application, target.uuid, target.created, client, readToken, writeToken, deps.log);
+  }
   if (mutating) {
     const uuid = uuids[0];
-    const kind = await resourceType(inputs.resourceType, uuid, client, readToken);
+    const kind = application ? "application" : await resourceType(inputs.resourceType, uuid, client, readToken);
     const path = `${kind}s/${uuid}`;
     const managed = new Set(csv(inputs.pruneEnvKeys));
     for (const key of managed) {
@@ -413,12 +574,18 @@ async function deploy(inputs, deps = defaultDependencies) {
     if (existing !== undefined && !Array.isArray(existing)) {
       throw new Error("Coolify returned an invalid environment list");
     }
-    const patch = inputs.patchFile ? record(await jsonFile(inputs.patchFile, "Patch", deps), "Patch file") : {};
+    const filePatch = inputs.patchFile ? record(await jsonFile(inputs.patchFile, "Patch", deps), "Patch file") : {};
+    const patch = { ...application?.update };
+    for (const [key, value] of Object.entries(filePatch)) {
+      if (key in patch)
+        throw new Error(`Patch field ${key} appears in both application-file and patch-file`);
+      patch[key] = value;
+    }
     if (inputs.imageTag) {
       if (kind !== "application")
         throw new Error("image-tag requires an application");
-      const application = record(await client.expect("GET", path, readToken), "Application response");
-      if (application.build_pack !== "dockerimage" || application.docker_registry_image_name !== inputs.imageName) {
+      const application2 = record(await client.expect("GET", path, readToken), "Application response");
+      if (application2.build_pack !== "dockerimage" || application2.docker_registry_image_name !== inputs.imageName) {
         throw new Error("The target is not the expected Docker Image application");
       }
       if (patch.docker_registry_image_tag !== undefined) {
@@ -535,6 +702,7 @@ var inputs = {
   uuids: input("uuids"),
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
+  applicationFile: input("application-file"),
   envFile: input("env-file"),
   envPrefix: input("env-prefix", "COOLIFY_ENV_"),
   requiredEnvKeys: input("required-env-keys"),
