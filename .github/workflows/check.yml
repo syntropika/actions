@@ -30,3 +30,14 @@ jobs:
       - run: bun run build
       - run: git diff --exit-code -- coolify-deploy/dist/main.js
       - run: node --check coolify-deploy/dist/main.js
+      - name: Check the packaged action on the runner
+        id: smoke
+        uses: ./coolify-deploy
+        continue-on-error: true
+        with:
+          url: https://coolify.invalid
+          deploy-token: local-smoke-token
+      - name: Confirm expected input validation
+        env:
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+        run: test "$SMOKE_OUTCOME" = failure
