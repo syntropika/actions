@@ -4,15 +4,14 @@ import { deploy, type Dependencies, type Inputs } from "../src/core.ts";
 function inputs(overrides: Partial<Inputs> = {}): Inputs {
   return {
     url: "https://coolify.example",
-    deployToken: "deploy-secret",
-    readToken: "read-secret",
-    writeToken: "write-secret",
+    token: "coolify-secret",
     uuids: "resource123",
     tags: "",
     resourceType: "application",
     applicationSlug: "",
     project: "",
     server: "",
+    destination: "",
     environment: "",
     createIfMissing: "",
     applicationFile: "",
@@ -102,9 +101,10 @@ describe("Coolify deployment", () => {
       "GET /api/v1/deployments/deployment123",
     ]);
     expect(f.calls.map((call) => call.token)).toEqual([
-      "Bearer read-secret", "Bearer write-secret", "Bearer write-secret",
-      "Bearer deploy-secret", "Bearer read-secret", "Bearer read-secret",
+      "Bearer coolify-secret", "Bearer coolify-secret", "Bearer coolify-secret",
+      "Bearer coolify-secret", "Bearer coolify-secret", "Bearer coolify-secret",
     ]);
+    expect(f.masked).toContain("coolify-secret");
     expect(f.calls[1]?.body).toEqual({ data: [{
       key: "API_KEY", value: "private-value", is_runtime: true, is_buildtime: false,
       is_preview: false, is_literal: true, is_shown_once: true,
@@ -120,11 +120,29 @@ describe("Coolify deployment", () => {
       { resource_uuid: "two", deployment_uuid: "deploy2" },
     ] }]]);
     const result = await deploy(inputs({
-      uuids: "", tags: "frontend, backend", readToken: "", writeToken: "", wait: "false", force: "true",
+      token: "deploy-only-secret", uuids: "", tags: "frontend, backend", wait: "false", force: "true",
     }), f.deps);
     expect(result.status).toBe("accepted");
     expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.token).toBe("Bearer deploy-only-secret");
     expect(f.calls[0]?.body).toEqual({ tag: "frontend,backend", force: true });
+  });
+
+  test("lets Coolify report insufficient token permissions", async () => {
+    const f = fixture([[403, { message: "Forbidden" }]], {
+      "/tmp/env.json": JSON.stringify({ API_KEY: "private-value" }),
+    });
+    await expect(deploy(inputs({ token: "deploy-only-secret", envFile: "/tmp/env.json" }), f.deps))
+      .rejects.toThrow("PATCH applications/resource123/envs/bulk failed with HTTP 403");
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.token).toBe("Bearer deploy-only-secret");
+    expect(JSON.stringify(f.logs)).not.toContain("private-value");
+  });
+
+  test("requires one token before contacting Coolify", async () => {
+    const f = fixture([]);
+    await expect(deploy(inputs({ token: "" }), f.deps)).rejects.toThrow("token is required");
+    expect(f.calls).toHaveLength(0);
   });
 
   test("detects services and removes only explicitly managed stale variables", async () => {
@@ -248,7 +266,7 @@ describe("Coolify deployment", () => {
       sopsFile: "deployment/prod.sops.json",
       sopsAgeKey: "age-secret",
       sopsEnvKeys: "DATABASE_URL",
-      deployToken: "", readToken: "", writeToken: "", wait: "false",
+      token: "", wait: "false",
     }), f.deps);
     expect(result.status).toBe("accepted");
     expect(f.calls.map((call) => call.token)).toEqual(["Bearer sops-token", "Bearer sops-token"]);
@@ -282,6 +300,10 @@ describe("Coolify deployment", () => {
       [200, [{ uuid: "project123", name: "syntropika" }]],
       [200, [{ id: 42, name: "production" }]],
       [200, [{ uuid: "server123", name: "ovh1" }]],
+      [200, [
+        { uuid: "destination123", name: "coolify", server_uuid: "server123" },
+        { uuid: "destination456", name: "other", server_uuid: "server123" },
+      ]],
       [200, []],
       [201, { uuid: "newapp123" }],
       [201, {}],
@@ -291,7 +313,7 @@ describe("Coolify deployment", () => {
       [200, { deployments: [{ resource_uuid: "newapp123" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) }, { COOLIFY_ENV_API_KEY: "private-value" });
     const result = await deploy(inputs({
-      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1", destination: "coolify",
       environment: "production", createIfMissing: "true", applicationFile: "/tmp/app.json",
       imageName: "ghcr.io/org/app", imageTag: "commit123",
       requiredEnvKeys: "API_KEY", wait: "false",
@@ -301,6 +323,7 @@ describe("Coolify deployment", () => {
       "GET /api/v1/projects",
       "GET /api/v1/projects/project123/environments",
       "GET /api/v1/servers",
+      "GET /api/v1/destinations",
       "GET /api/v1/applications",
       "POST /api/v1/applications/dockerimage",
       "POST /api/v1/applications/newapp123/storages",
@@ -309,18 +332,18 @@ describe("Coolify deployment", () => {
       "PATCH /api/v1/applications/newapp123",
       "POST /api/v1/deploy",
     ]);
-    expect(f.calls[4]?.body).toEqual({
+    expect(f.calls[5]?.body).toEqual({
       autogenerate_domain: false, health_check_enabled: false,
-      project_uuid: "project123", server_uuid: "server123", environment_name: "production",
+      project_uuid: "project123", server_uuid: "server123", destination_uuid: "destination123", environment_name: "production",
       name: "call-recorder-bot", docker_registry_image_name: "ghcr.io/org/app",
       docker_registry_image_tag: "commit123", instant_deploy: false,
     });
-    expect(f.calls[5]?.body).toEqual({ type: "persistent", name: "call-recorder-data", mount_path: "/app/data" });
-    expect(f.calls[8]?.body).toEqual({
+    expect(f.calls[6]?.body).toEqual({ type: "persistent", name: "call-recorder-data", mount_path: "/app/data" });
+    expect(f.calls[9]?.body).toEqual({
       is_consistent_container_name_enabled: true, stop_grace_period: 300,
       docker_registry_image_tag: "commit123",
     });
-    expect(f.calls[9]?.body).toEqual({ uuid: "newapp123", force: false });
+    expect(f.calls[10]?.body).toEqual({ uuid: "newapp123", force: false });
     expect(JSON.stringify(f.logs)).not.toContain("private-value");
   });
 
@@ -331,20 +354,24 @@ describe("Coolify deployment", () => {
       [200, [{ id: 42, name: "production" }]],
       [200, [{ uuid: "server123", name: "ovh1" }]],
       [200, [
+        { uuid: "destination123", name: "coolify", server_uuid: "server123" },
+        { uuid: "destination456", name: "other", server_uuid: "server123" },
+      ]],
+      [200, [
         { uuid: "elsewhere123", name: "call-recorder-bot", environment_id: 42,
           build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" },
         { uuid: "existing123", name: "call-recorder-bot", environment_id: 42,
           build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" },
       ]],
-      [200, [{ is_primary: true, server_uuid: "other-server" }]],
-      [200, [{ is_primary: true, server_uuid: "server123" }]],
+      [200, [{ is_primary: true, server_uuid: "server123", uuid: "destination456" }]],
+      [200, [{ is_primary: true, server_uuid: "server123", uuid: "destination123" }]],
       [200, { persistent_storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] }],
       [200, { build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" }],
       [200, { uuid: "existing123" }],
       [200, { deployments: [{ resource_uuid: "existing123" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) });
     const result = await deploy(inputs({
-      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1", destination: "coolify",
       environment: "production", applicationFile: "/tmp/app.json",
       imageName: "ghcr.io/org/app", imageTag: "commit456", wait: "false",
     }), f.deps);
@@ -353,6 +380,7 @@ describe("Coolify deployment", () => {
       "GET /api/v1/projects",
       "GET /api/v1/projects/project123/environments",
       "GET /api/v1/servers",
+      "GET /api/v1/destinations",
       "GET /api/v1/applications",
       "GET /api/v1/applications/elsewhere123/destinations",
       "GET /api/v1/applications/existing123/destinations",

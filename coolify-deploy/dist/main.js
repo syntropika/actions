@@ -109,7 +109,7 @@ function selected(input, override, context) {
 }
 function applicationSpec(value, selection) {
   const input = object(value, "Application file");
-  const allowed = new Set(["slug", "project", "server", "environment", "create_if_missing", "create", "update", "storages"]);
+  const allowed = new Set(["slug", "project", "server", "destination", "environment", "create_if_missing", "create", "update", "storages"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key))
       throw new Error(`Application file has unsupported field ${key}`);
@@ -131,7 +131,7 @@ function applicationSpec(value, selection) {
   }
   if (typeof createIfMissing !== "boolean")
     throw new Error("create_if_missing must be true or false");
-  const reserved = ["project_uuid", "server_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
+  const reserved = ["project_uuid", "server_uuid", "destination_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
   const create = options(input.create, "Application create options", reserved);
   const update = options(input.update, "Application update options", [...reserved, "build_pack"]);
   const storages = input.storages === undefined ? [] : list(input.storages, "Application storages").map((entry, index) => {
@@ -157,11 +157,13 @@ function applicationSpec(value, selection) {
   }
   const project = selected(input.project, selection.project, "Application project");
   const server = selected(input.server, selection.server, "Application server");
+  const destination = selected(input.destination, selection.destination, "Application destination");
   const environment = selected(input.environment, selection.environment, "Application environment");
   return {
     slug,
     project: project === undefined ? "" : string(project, "Application project"),
     server: server === undefined ? "" : string(server, "Application server"),
+    destination: destination === undefined ? "" : string(destination, "Application destination"),
     environment: environment === undefined ? "production" : string(environment, "Application environment"),
     create_if_missing: createIfMissing,
     create,
@@ -176,28 +178,34 @@ function select(items, selector, context) {
   }
   return matches[0];
 }
-async function resolveApplication(spec, imageName, imageTag, api, readToken, writeToken) {
-  const projects = list(await api.expect("GET", "projects", readToken), "Coolify projects");
+async function resolveApplication(spec, imageName, imageTag, api) {
+  const projects = list(await api.expect("GET", "projects"), "Coolify projects");
   const project = select(projects, spec.project, "project");
   const projectUuid = identifier(project.uuid, "Project UUID");
-  const environments = list(await api.expect("GET", `projects/${projectUuid}/environments`, readToken), "Coolify environments");
+  const environments = list(await api.expect("GET", `projects/${projectUuid}/environments`), "Coolify environments");
   const environment = select(environments, spec.environment, "environment");
   if (typeof environment.id !== "number")
     throw new Error("Coolify environment has no numeric ID");
-  const servers = list(await api.expect("GET", "servers", readToken), "Coolify servers");
+  const servers = list(await api.expect("GET", "servers"), "Coolify servers");
   const server = select(servers, spec.server, "server");
   const serverUuid = identifier(server.uuid, "Server UUID");
-  const applications = list(await api.expect("GET", "applications", readToken), "Coolify applications");
+  let destinationUuid;
+  if (spec.destination) {
+    const destinations = list(await api.expect("GET", "destinations"), "Coolify destinations");
+    const destination = select(destinations.filter((item) => item.server_uuid === serverUuid), spec.destination, "destination");
+    destinationUuid = identifier(destination.uuid, "Destination UUID");
+  }
+  const applications = list(await api.expect("GET", "applications"), "Coolify applications");
   const candidates = applications.filter((item) => item.name === spec.slug && item.environment_id === environment.id);
   const matches = [];
   for (const candidate of candidates) {
     const uuid = identifier(candidate.uuid, "Application UUID");
-    const destinations = list(await api.expect("GET", `applications/${uuid}/destinations`, readToken), "Application destinations");
+    const destinations = list(await api.expect("GET", `applications/${uuid}/destinations`), "Application destinations");
     const primary = destinations.filter((destination) => destination.is_primary === true);
     if (primary.length !== 1 || typeof primary[0]?.server_uuid !== "string") {
       throw new Error(`Application ${uuid} has no identifiable primary server`);
     }
-    if (primary[0].server_uuid === serverUuid)
+    if (primary[0].server_uuid === serverUuid && (!destinationUuid || primary[0].uuid === destinationUuid))
       matches.push(candidate);
   }
   if (matches.length > 1)
@@ -211,10 +219,11 @@ async function resolveApplication(spec, imageName, imageTag, api, readToken, wri
   }
   if (!spec.create_if_missing)
     throw new Error(`Application slug ${spec.slug} was not found`);
-  const created = object(await api.expect("POST", "applications/dockerimage", writeToken, {
+  const created = object(await api.expect("POST", "applications/dockerimage", {
     ...spec.create,
     project_uuid: projectUuid,
     server_uuid: serverUuid,
+    ...destinationUuid ? { destination_uuid: destinationUuid } : {},
     environment_name: spec.environment,
     name: spec.slug,
     docker_registry_image_name: imageName,
@@ -223,17 +232,17 @@ async function resolveApplication(spec, imageName, imageTag, api, readToken, wri
   }), "Created application");
   return { uuid: identifier(created.uuid, "Created application UUID"), created: true };
 }
-async function syncPersistentStorages(spec, uuid, created, api, readToken, writeToken, log) {
+async function syncPersistentStorages(spec, uuid, created, api, log) {
   if (spec.storages.length === 0)
     return;
-  const existing = created ? [] : list(object(await api.expect("GET", `applications/${uuid}/storages`, readToken), "Coolify storages").persistent_storages, "Coolify persistent storages");
+  const existing = created ? [] : list(object(await api.expect("GET", `applications/${uuid}/storages`), "Coolify storages").persistent_storages, "Coolify persistent storages");
   for (const storage of spec.storages) {
     const matching = existing.filter((entry) => entry.name === storage.name || entry.mount_path === storage.mount_path);
     if (matching.length > 1 || matching.some((entry) => entry.name !== storage.name || entry.mount_path !== storage.mount_path)) {
       throw new Error(`Persistent storage ${storage.name} conflicts with an existing storage`);
     }
     if (matching.length === 0) {
-      await api.expect("POST", `applications/${uuid}/storages`, writeToken, { type: "persistent", ...storage });
+      await api.expect("POST", `applications/${uuid}/storages`, { type: "persistent", ...storage });
       log(`Created persistent storage ${storage.name} for application ${uuid}`);
     }
   }
@@ -440,19 +449,21 @@ function imageTag(value) {
 
 class Coolify {
   root;
+  token;
   deps;
-  constructor(root, deps) {
+  constructor(root, token, deps) {
     this.root = root;
+    this.token = token;
     this.deps = deps;
   }
-  async request(method, path, token, body) {
+  async request(method, path, body) {
     const url = new URL(path.replace(/^\//, ""), this.root);
     let response;
     try {
       response = await this.deps.fetch(url, {
         method,
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${this.token}`,
           Accept: "application/json",
           ...body === undefined ? {} : { "Content-Type": "application/json" }
         },
@@ -474,8 +485,8 @@ class Coolify {
     }
     return { status: response.status, data };
   }
-  async expect(method, path, token, body) {
-    const result = await this.request(method, path, token, body);
+  async expect(method, path, body) {
+    const result = await this.request(method, path, body);
     if (result.status < 200 || result.status >= 300) {
       throw new Error(`${method} ${path} failed with HTTP ${result.status}`);
     }
@@ -502,19 +513,17 @@ function deploymentList(value) {
     };
   });
 }
-async function resourceType(requested, uuid, client, readToken) {
+async function resourceType(requested, uuid, client) {
   if (requested === "application" || requested === "service")
     return requested;
   if (requested !== "auto")
     throw new Error("resource-type must be application, service, or auto");
-  if (!readToken)
-    throw new Error("read-token is required to detect resource type");
-  const application = await client.request("GET", `applications/${uuid}`, readToken);
+  const application = await client.request("GET", `applications/${uuid}`);
   if (application.status >= 200 && application.status < 300)
     return "application";
   if (application.status !== 404)
     throw new Error(`GET applications/${uuid} failed with HTTP ${application.status}`);
-  const service = await client.request("GET", `services/${uuid}`, readToken);
+  const service = await client.request("GET", `services/${uuid}`);
   if (service.status >= 200 && service.status < 300)
     return "service";
   throw new Error(`Could not find application or service ${uuid} (service lookup HTTP ${service.status})`);
@@ -523,13 +532,14 @@ async function deploy(inputs, deps = defaultDependencies) {
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
   const applicationRequested = Boolean(inputs.applicationSlug || inputs.applicationFile);
-  if (!applicationRequested && (inputs.project || inputs.server || inputs.environment || inputs.createIfMissing)) {
-    throw new Error("project, server, environment, and create-if-missing require application-slug or application-file");
+  if (!applicationRequested && (inputs.project || inputs.server || inputs.destination || inputs.environment || inputs.createIfMissing)) {
+    throw new Error("project, server, destination, environment, and create-if-missing require application-slug or application-file");
   }
   const application = applicationRequested ? applicationSpec(inputs.applicationFile ? await jsonFile(inputs.applicationFile, "Application", deps) : {}, {
     slug: inputs.applicationSlug,
     project: inputs.project,
     server: inputs.server,
+    destination: inputs.destination,
     environment: inputs.environment,
     createIfMissing: inputs.createIfMissing
   }) : undefined;
@@ -577,30 +587,25 @@ async function deploy(inputs, deps = defaultDependencies) {
     throw new Error("image-tag is required with image-name");
   if (application && !inputs.imageTag)
     throw new Error("application-slug requires image-name and image-tag");
-  const writeToken = inputs.writeToken || sopsToken;
-  const readToken = inputs.readToken || writeToken;
-  if (mutating && !writeToken)
-    throw new Error("write-token is required for configuration updates");
-  if (wait && !readToken)
-    throw new Error("read-token is required when wait is true");
-  const token = required(inputs.deployToken || sopsToken, "deploy-token");
-  const client = new Coolify(baseUrl(inputs.url), deps);
+  const token = required(inputs.token || sopsToken, "token");
+  deps.mask(token);
+  const client = new Coolify(baseUrl(inputs.url), token, deps);
   if (application) {
-    const target = await resolveApplication(application, inputs.imageName, imageTag(inputs.imageTag), client, readToken, writeToken);
+    const target = await resolveApplication(application, inputs.imageName, imageTag(inputs.imageTag), client);
     uuids.push(target.uuid);
     deps.log(`${target.created ? "Created" : "Found"} application ${application.slug}: ${target.uuid}`);
-    await syncPersistentStorages(application, target.uuid, target.created, client, readToken, writeToken, deps.log);
+    await syncPersistentStorages(application, target.uuid, target.created, client, deps.log);
   }
   if (mutating) {
     const uuid = uuids[0];
-    const kind = application ? "application" : await resourceType(inputs.resourceType, uuid, client, readToken);
+    const kind = application ? "application" : await resourceType(inputs.resourceType, uuid, client);
     const path = `${kind}s/${uuid}`;
     const managed = new Set(csv(inputs.pruneEnvKeys));
     for (const key of managed) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
         throw new Error(`Invalid managed environment key ${key}`);
     }
-    const existing = managed.size > 0 ? await client.expect("GET", `${path}/envs`, readToken) : undefined;
+    const existing = managed.size > 0 ? await client.expect("GET", `${path}/envs`) : undefined;
     if (existing !== undefined && !Array.isArray(existing)) {
       throw new Error("Coolify returned an invalid environment list");
     }
@@ -614,7 +619,7 @@ async function deploy(inputs, deps = defaultDependencies) {
     if (inputs.imageTag) {
       if (kind !== "application")
         throw new Error("image-tag requires an application");
-      const application2 = record(await client.expect("GET", path, readToken), "Application response");
+      const application2 = record(await client.expect("GET", path), "Application response");
       if (application2.build_pack !== "dockerimage" || application2.docker_registry_image_name !== inputs.imageName) {
         throw new Error("The target is not the expected Docker Image application");
       }
@@ -624,7 +629,7 @@ async function deploy(inputs, deps = defaultDependencies) {
       patch.docker_registry_image_tag = imageTag(inputs.imageTag);
     }
     if (envs.length > 0) {
-      await client.expect("PATCH", `${path}/envs/bulk`, writeToken, { data: envs });
+      await client.expect("PATCH", `${path}/envs/bulk`, { data: envs });
       deps.log(`Updated ${envs.length} environment variables for ${kind} ${uuid}`);
     }
     if (managed.size > 0 && Array.isArray(existing)) {
@@ -635,12 +640,12 @@ async function deploy(inputs, deps = defaultDependencies) {
           continue;
         if (typeof entry.uuid !== "string")
           throw new Error(`Environment variable ${entry.key} has no UUID`);
-        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`, writeToken);
+        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`);
         deps.log(`Removed managed environment variable ${entry.key}`);
       }
     }
     if (Object.keys(patch).length > 0) {
-      await client.expect("PATCH", path, writeToken, patch);
+      await client.expect("PATCH", path, patch);
       deps.log(`Updated ${kind} configuration for ${uuid}`);
     }
   }
@@ -653,7 +658,7 @@ async function deploy(inputs, deps = defaultDependencies) {
     payload.pull_request_id = prId;
   if (inputs.dockerTag)
     payload.docker_tag = inputs.dockerTag;
-  const accepted = deploymentList(await client.expect("POST", "deploy", token, payload));
+  const accepted = deploymentList(await client.expect("POST", "deploy", payload));
   deps.onAccepted(accepted);
   for (const entry of accepted) {
     deps.log(`Coolify accepted ${entry.resource_uuid}: ${entry.deployment_uuid || "no deployment UUID"}`);
@@ -671,7 +676,7 @@ async function deploy(inputs, deps = defaultDependencies) {
     if (deps.now() >= deadline)
       throw new Error(`Timed out waiting for ${pending.size} Coolify deployment(s)`);
     for (const id of [...pending]) {
-      const response = record(await client.expect("GET", `deployments/${pathPart(id, "deployment UUID")}`, readToken), "Deployment status");
+      const response = record(await client.expect("GET", `deployments/${pathPart(id, "deployment UUID")}`), "Deployment status");
       if (response.status === "finished") {
         pending.delete(id);
         deps.log(`Coolify deployment ${id} finished`);
@@ -726,15 +731,14 @@ function accepted(deployments) {
 }
 var inputs = {
   url: input("url"),
-  deployToken: input("deploy-token"),
-  readToken: input("read-token"),
-  writeToken: input("write-token"),
+  token: input("token"),
   uuids: input("uuids"),
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
   applicationSlug: input("application-slug"),
   project: input("project"),
   server: input("server"),
+  destination: input("destination"),
   environment: input("environment"),
   createIfMissing: input("create-if-missing"),
   applicationFile: input("application-file"),
