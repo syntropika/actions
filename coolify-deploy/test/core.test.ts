@@ -4,9 +4,7 @@ import { deploy, type Dependencies, type Inputs } from "../src/core.ts";
 function inputs(overrides: Partial<Inputs> = {}): Inputs {
   return {
     url: "https://coolify.example",
-    deployToken: "deploy-secret",
-    readToken: "read-secret",
-    writeToken: "write-secret",
+    token: "coolify-secret",
     uuids: "resource123",
     tags: "",
     resourceType: "application",
@@ -102,9 +100,10 @@ describe("Coolify deployment", () => {
       "GET /api/v1/deployments/deployment123",
     ]);
     expect(f.calls.map((call) => call.token)).toEqual([
-      "Bearer read-secret", "Bearer write-secret", "Bearer write-secret",
-      "Bearer deploy-secret", "Bearer read-secret", "Bearer read-secret",
+      "Bearer coolify-secret", "Bearer coolify-secret", "Bearer coolify-secret",
+      "Bearer coolify-secret", "Bearer coolify-secret", "Bearer coolify-secret",
     ]);
+    expect(f.masked).toContain("coolify-secret");
     expect(f.calls[1]?.body).toEqual({ data: [{
       key: "API_KEY", value: "private-value", is_runtime: true, is_buildtime: false,
       is_preview: false, is_literal: true, is_shown_once: true,
@@ -120,11 +119,29 @@ describe("Coolify deployment", () => {
       { resource_uuid: "two", deployment_uuid: "deploy2" },
     ] }]]);
     const result = await deploy(inputs({
-      uuids: "", tags: "frontend, backend", readToken: "", writeToken: "", wait: "false", force: "true",
+      token: "deploy-only-secret", uuids: "", tags: "frontend, backend", wait: "false", force: "true",
     }), f.deps);
     expect(result.status).toBe("accepted");
     expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.token).toBe("Bearer deploy-only-secret");
     expect(f.calls[0]?.body).toEqual({ tag: "frontend,backend", force: true });
+  });
+
+  test("lets Coolify report insufficient token permissions", async () => {
+    const f = fixture([[403, { message: "Forbidden" }]], {
+      "/tmp/env.json": JSON.stringify({ API_KEY: "private-value" }),
+    });
+    await expect(deploy(inputs({ token: "deploy-only-secret", envFile: "/tmp/env.json" }), f.deps))
+      .rejects.toThrow("PATCH applications/resource123/envs/bulk failed with HTTP 403");
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.token).toBe("Bearer deploy-only-secret");
+    expect(JSON.stringify(f.logs)).not.toContain("private-value");
+  });
+
+  test("requires one token before contacting Coolify", async () => {
+    const f = fixture([]);
+    await expect(deploy(inputs({ token: "" }), f.deps)).rejects.toThrow("token is required");
+    expect(f.calls).toHaveLength(0);
   });
 
   test("detects services and removes only explicitly managed stale variables", async () => {
@@ -248,7 +265,7 @@ describe("Coolify deployment", () => {
       sopsFile: "deployment/prod.sops.json",
       sopsAgeKey: "age-secret",
       sopsEnvKeys: "DATABASE_URL",
-      deployToken: "", readToken: "", writeToken: "", wait: "false",
+      token: "", wait: "false",
     }), f.deps);
     expect(result.status).toBe("accepted");
     expect(f.calls.map((call) => call.token)).toEqual(["Bearer sops-token", "Bearer sops-token"]);

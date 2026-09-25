@@ -1,7 +1,7 @@
 type JsonRecord = Record<string, unknown>;
 
 interface Api {
-  expect(method: string, path: string, token: string, body?: unknown): Promise<unknown>;
+  expect(method: string, path: string, body?: unknown): Promise<unknown>;
 }
 
 export interface PersistentStorage {
@@ -138,24 +138,22 @@ export async function resolveApplication(
   imageName: string,
   imageTag: string,
   api: Api,
-  readToken: string,
-  writeToken: string,
 ): Promise<{ uuid: string; created: boolean }> {
-  const projects = list(await api.expect("GET", "projects", readToken), "Coolify projects");
+  const projects = list(await api.expect("GET", "projects"), "Coolify projects");
   const project = select(projects, spec.project, "project");
   const projectUuid = identifier(project.uuid, "Project UUID");
-  const environments = list(await api.expect("GET", `projects/${projectUuid}/environments`, readToken), "Coolify environments");
+  const environments = list(await api.expect("GET", `projects/${projectUuid}/environments`), "Coolify environments");
   const environment = select(environments, spec.environment, "environment");
   if (typeof environment.id !== "number") throw new Error("Coolify environment has no numeric ID");
-  const servers = list(await api.expect("GET", "servers", readToken), "Coolify servers");
+  const servers = list(await api.expect("GET", "servers"), "Coolify servers");
   const server = select(servers, spec.server, "server");
   const serverUuid = identifier(server.uuid, "Server UUID");
-  const applications = list(await api.expect("GET", "applications", readToken), "Coolify applications");
+  const applications = list(await api.expect("GET", "applications"), "Coolify applications");
   const candidates = applications.filter((item) => item.name === spec.slug && item.environment_id === environment.id);
   const matches: JsonRecord[] = [];
   for (const candidate of candidates) {
     const uuid = identifier(candidate.uuid, "Application UUID");
-    const destinations = list(await api.expect("GET", `applications/${uuid}/destinations`, readToken), "Application destinations");
+    const destinations = list(await api.expect("GET", `applications/${uuid}/destinations`), "Application destinations");
     const primary = destinations.filter((destination) => destination.is_primary === true);
     if (primary.length !== 1 || typeof primary[0]?.server_uuid !== "string") {
       throw new Error(`Application ${uuid} has no identifiable primary server`);
@@ -171,7 +169,7 @@ export async function resolveApplication(
     return { uuid: identifier(application.uuid, "Application UUID"), created: false };
   }
   if (!spec.create_if_missing) throw new Error(`Application slug ${spec.slug} was not found`);
-  const created = object(await api.expect("POST", "applications/dockerimage", writeToken, {
+  const created = object(await api.expect("POST", "applications/dockerimage", {
     ...spec.create,
     project_uuid: projectUuid,
     server_uuid: serverUuid,
@@ -189,13 +187,11 @@ export async function syncPersistentStorages(
   uuid: string,
   created: boolean,
   api: Api,
-  readToken: string,
-  writeToken: string,
   log: (message: string) => void,
 ): Promise<void> {
   if (spec.storages.length === 0) return;
   const existing = created ? [] : list(
-    object(await api.expect("GET", `applications/${uuid}/storages`, readToken), "Coolify storages").persistent_storages,
+    object(await api.expect("GET", `applications/${uuid}/storages`), "Coolify storages").persistent_storages,
     "Coolify persistent storages",
   );
   for (const storage of spec.storages) {
@@ -204,7 +200,7 @@ export async function syncPersistentStorages(
       throw new Error(`Persistent storage ${storage.name} conflicts with an existing storage`);
     }
     if (matching.length === 0) {
-      await api.expect("POST", `applications/${uuid}/storages`, writeToken, { type: "persistent", ...storage });
+      await api.expect("POST", `applications/${uuid}/storages`, { type: "persistent", ...storage });
       log(`Created persistent storage ${storage.name} for application ${uuid}`);
     }
   }

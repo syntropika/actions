@@ -7,9 +7,7 @@ type JsonRecord = Record<string, unknown>;
 
 export interface Inputs {
   url: string;
-  deployToken: string;
-  readToken: string;
-  writeToken: string;
+  token: string;
   uuids: string;
   tags: string;
   resourceType: string;
@@ -253,17 +251,18 @@ function imageTag(value: string): string {
 class Coolify {
   constructor(
     private readonly root: URL,
+    private readonly token: string,
     private readonly deps: Dependencies,
   ) {}
 
-  async request(method: string, path: string, token: string, body?: unknown): Promise<{ status: number; data: unknown }> {
+  async request(method: string, path: string, body?: unknown): Promise<{ status: number; data: unknown }> {
     const url = new URL(path.replace(/^\//, ""), this.root);
     let response: Response;
     try {
       response = await this.deps.fetch(url, {
         method,
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${this.token}`,
           Accept: "application/json",
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         },
@@ -286,8 +285,8 @@ class Coolify {
     return { status: response.status, data };
   }
 
-  async expect(method: string, path: string, token: string, body?: unknown): Promise<unknown> {
-    const result = await this.request(method, path, token, body);
+  async expect(method: string, path: string, body?: unknown): Promise<unknown> {
+    const result = await this.request(method, path, body);
     if (result.status < 200 || result.status >= 300) {
       throw new Error(`${method} ${path} failed with HTTP ${result.status}`);
     }
@@ -321,15 +320,13 @@ async function resourceType(
   requested: string,
   uuid: string,
   client: Coolify,
-  readToken: string,
 ): Promise<ResourceType> {
   if (requested === "application" || requested === "service") return requested;
   if (requested !== "auto") throw new Error("resource-type must be application, service, or auto");
-  if (!readToken) throw new Error("read-token is required to detect resource type");
-  const application = await client.request("GET", `applications/${uuid}`, readToken);
+  const application = await client.request("GET", `applications/${uuid}`);
   if (application.status >= 200 && application.status < 300) return "application";
   if (application.status !== 404) throw new Error(`GET applications/${uuid} failed with HTTP ${application.status}`);
-  const service = await client.request("GET", `services/${uuid}`, readToken);
+  const service = await client.request("GET", `services/${uuid}`);
   if (service.status >= 200 && service.status < 300) return "service";
   throw new Error(`Could not find application or service ${uuid} (service lookup HTTP ${service.status})`);
 }
@@ -390,29 +387,26 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   if (inputs.imageTag && !inputs.imageName) throw new Error("image-name is required with image-tag");
   if (inputs.imageName && !inputs.imageTag) throw new Error("image-tag is required with image-name");
   if (application && !inputs.imageTag) throw new Error("application-slug requires image-name and image-tag");
-  const writeToken = inputs.writeToken || sopsToken;
-  const readToken = inputs.readToken || writeToken;
-  if (mutating && !writeToken) throw new Error("write-token is required for configuration updates");
-  if (wait && !readToken) throw new Error("read-token is required when wait is true");
-  const token = required(inputs.deployToken || sopsToken, "deploy-token");
-  const client = new Coolify(baseUrl(inputs.url), deps);
+  const token = required(inputs.token || sopsToken, "token");
+  deps.mask(token);
+  const client = new Coolify(baseUrl(inputs.url), token, deps);
 
   if (application) {
-    const target = await resolveApplication(application, inputs.imageName, imageTag(inputs.imageTag), client, readToken, writeToken);
+    const target = await resolveApplication(application, inputs.imageName, imageTag(inputs.imageTag), client);
     uuids.push(target.uuid);
     deps.log(`${target.created ? "Created" : "Found"} application ${application.slug}: ${target.uuid}`);
-    await syncPersistentStorages(application, target.uuid, target.created, client, readToken, writeToken, deps.log);
+    await syncPersistentStorages(application, target.uuid, target.created, client, deps.log);
   }
 
   if (mutating) {
     const uuid = uuids[0]!;
-    const kind = application ? "application" : await resourceType(inputs.resourceType, uuid, client, readToken);
+    const kind = application ? "application" : await resourceType(inputs.resourceType, uuid, client);
     const path = `${kind}s/${uuid}`;
     const managed = new Set(csv(inputs.pruneEnvKeys));
     for (const key of managed) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid managed environment key ${key}`);
     }
-    const existing = managed.size > 0 ? await client.expect("GET", `${path}/envs`, readToken) : undefined;
+    const existing = managed.size > 0 ? await client.expect("GET", `${path}/envs`) : undefined;
     if (existing !== undefined && !Array.isArray(existing)) {
       throw new Error("Coolify returned an invalid environment list");
     }
@@ -426,7 +420,7 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
     }
     if (inputs.imageTag) {
       if (kind !== "application") throw new Error("image-tag requires an application");
-      const application = record(await client.expect("GET", path, readToken), "Application response");
+      const application = record(await client.expect("GET", path), "Application response");
       if (application.build_pack !== "dockerimage" || application.docker_registry_image_name !== inputs.imageName) {
         throw new Error("The target is not the expected Docker Image application");
       }
@@ -436,7 +430,7 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
       patch.docker_registry_image_tag = imageTag(inputs.imageTag);
     }
     if (envs.length > 0) {
-      await client.expect("PATCH", `${path}/envs/bulk`, writeToken, { data: envs });
+      await client.expect("PATCH", `${path}/envs/bulk`, { data: envs });
       deps.log(`Updated ${envs.length} environment variables for ${kind} ${uuid}`);
     }
     if (managed.size > 0 && Array.isArray(existing)) {
@@ -445,13 +439,13 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
         const entry = record(value, "Existing environment variable");
         if (typeof entry.key !== "string" || !managed.has(entry.key) || desired.has(entry.key) || entry.is_preview === true) continue;
         if (typeof entry.uuid !== "string") throw new Error(`Environment variable ${entry.key} has no UUID`);
-        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`, writeToken);
+        await client.expect("DELETE", `${path}/envs/${pathPart(entry.uuid, "environment UUID")}`);
         deps.log(`Removed managed environment variable ${entry.key}`);
       }
     }
 
     if (Object.keys(patch).length > 0) {
-      await client.expect("PATCH", path, writeToken, patch);
+      await client.expect("PATCH", path, patch);
       deps.log(`Updated ${kind} configuration for ${uuid}`);
     }
   }
@@ -461,7 +455,7 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   if (tags.length > 0) payload.tag = tags.join(",");
   if (prId) payload.pull_request_id = prId;
   if (inputs.dockerTag) payload.docker_tag = inputs.dockerTag;
-  const accepted = deploymentList(await client.expect("POST", "deploy", token, payload));
+  const accepted = deploymentList(await client.expect("POST", "deploy", payload));
   deps.onAccepted(accepted);
   for (const entry of accepted) {
     deps.log(`Coolify accepted ${entry.resource_uuid}: ${entry.deployment_uuid || "no deployment UUID"}`);
@@ -477,7 +471,7 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   while (pending.size > 0) {
     if (deps.now() >= deadline) throw new Error(`Timed out waiting for ${pending.size} Coolify deployment(s)`);
     for (const id of [...pending]) {
-      const response = record(await client.expect("GET", `deployments/${pathPart(id, "deployment UUID")}`, readToken), "Deployment status");
+      const response = record(await client.expect("GET", `deployments/${pathPart(id, "deployment UUID")}`), "Deployment status");
       if (response.status === "finished") {
         pending.delete(id);
         deps.log(`Coolify deployment ${id} finished`);

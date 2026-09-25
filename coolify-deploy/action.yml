@@ -6,14 +6,8 @@ inputs:
   url:
     description: Coolify base URL, with or without /api/v1
     required: true
-  deploy-token:
-    description: Coolify token with deploy permission; may come from sops-token-key instead
-    required: false
-  read-token:
-    description: Coolify token with read permission; required to wait, detect resource type, or verify an image
-    required: false
-  write-token:
-    description: Coolify token with write permission; required to update environment variables or resource configuration
+  token:
+    description: Coolify API token with permissions for the requested operations; may come from sops-token-key instead
     required: false
   uuids:
     description: One or more resource UUIDs, separated by commas; exclusive with tags and application-slug

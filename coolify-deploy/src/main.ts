@@ -19,9 +19,7 @@ function accepted(deployments: Deployment[]): void {
 
 const inputs: Inputs = {
   url: input("url"),
-  deployToken: input("deploy-token"),
-  readToken: input("read-token"),
-  writeToken: input("write-token"),
+  token: input("token"),
   uuids: input("uuids"),
   tags: input("tags"),
   resourceType: input("resource-type", "auto"),
