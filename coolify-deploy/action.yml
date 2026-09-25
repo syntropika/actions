@@ -24,6 +24,9 @@ inputs:
   server:
     description: Existing Coolify server name or UUID used to resolve an application slug
     required: false
+  destination:
+    description: Existing Docker destination name on the selected server; required for creation when the server has multiple destinations
+    required: false
   environment:
     description: Existing Coolify environment name used to resolve an application slug; defaults to production
     required: false

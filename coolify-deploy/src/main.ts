@@ -26,6 +26,7 @@ const inputs: Inputs = {
   applicationSlug: input("application-slug"),
   project: input("project"),
   server: input("server"),
+  destination: input("destination"),
   environment: input("environment"),
   createIfMissing: input("create-if-missing"),
   applicationFile: input("application-file"),

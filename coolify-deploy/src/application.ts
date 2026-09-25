@@ -13,6 +13,7 @@ export interface ApplicationSpec {
   slug: string;
   project: string;
   server: string;
+  destination: string;
   environment: string;
   create_if_missing: boolean;
   create: JsonRecord;
@@ -24,6 +25,7 @@ export interface ApplicationSelection {
   slug: string;
   project: string;
   server: string;
+  destination: string;
   environment: string;
   createIfMissing: string;
 }
@@ -68,7 +70,7 @@ function selected(input: unknown, override: string, context: string): unknown {
 
 export function applicationSpec(value: unknown, selection: ApplicationSelection): ApplicationSpec {
   const input = object(value, "Application file");
-  const allowed = new Set(["slug", "project", "server", "environment", "create_if_missing", "create", "update", "storages"]);
+  const allowed = new Set(["slug", "project", "server", "destination", "environment", "create_if_missing", "create", "update", "storages"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new Error(`Application file has unsupported field ${key}`);
   }
@@ -88,7 +90,7 @@ export function applicationSpec(value: unknown, selection: ApplicationSelection)
     createIfMissing = override;
   }
   if (typeof createIfMissing !== "boolean") throw new Error("create_if_missing must be true or false");
-  const reserved = ["project_uuid", "server_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
+  const reserved = ["project_uuid", "server_uuid", "destination_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
   const create = options(input.create, "Application create options", reserved);
   const update = options(input.update, "Application update options", [...reserved, "build_pack"]);
   const storages = input.storages === undefined ? [] : list(input.storages, "Application storages").map((entry, index) => {
@@ -110,11 +112,13 @@ export function applicationSpec(value: unknown, selection: ApplicationSelection)
   }
   const project = selected(input.project, selection.project, "Application project");
   const server = selected(input.server, selection.server, "Application server");
+  const destination = selected(input.destination, selection.destination, "Application destination");
   const environment = selected(input.environment, selection.environment, "Application environment");
   return {
     slug,
     project: project === undefined ? "" : string(project, "Application project"),
     server: server === undefined ? "" : string(server, "Application server"),
+    destination: destination === undefined ? "" : string(destination, "Application destination"),
     environment: environment === undefined ? "production" : string(environment, "Application environment"),
     create_if_missing: createIfMissing,
     create,
@@ -148,6 +152,12 @@ export async function resolveApplication(
   const servers = list(await api.expect("GET", "servers"), "Coolify servers");
   const server = select(servers, spec.server, "server");
   const serverUuid = identifier(server.uuid, "Server UUID");
+  let destinationUuid: string | undefined;
+  if (spec.destination) {
+    const destinations = list(await api.expect("GET", "destinations"), "Coolify destinations");
+    const destination = select(destinations.filter((item) => item.server_uuid === serverUuid), spec.destination, "destination");
+    destinationUuid = identifier(destination.uuid, "Destination UUID");
+  }
   const applications = list(await api.expect("GET", "applications"), "Coolify applications");
   const candidates = applications.filter((item) => item.name === spec.slug && item.environment_id === environment.id);
   const matches: JsonRecord[] = [];
@@ -158,7 +168,7 @@ export async function resolveApplication(
     if (primary.length !== 1 || typeof primary[0]?.server_uuid !== "string") {
       throw new Error(`Application ${uuid} has no identifiable primary server`);
     }
-    if (primary[0].server_uuid === serverUuid) matches.push(candidate);
+    if (primary[0].server_uuid === serverUuid && (!destinationUuid || primary[0].uuid === destinationUuid)) matches.push(candidate);
   }
   if (matches.length > 1) throw new Error(`Application slug ${spec.slug} is ambiguous in environment ${spec.environment}`);
   if (matches.length === 1) {
@@ -173,6 +183,7 @@ export async function resolveApplication(
     ...spec.create,
     project_uuid: projectUuid,
     server_uuid: serverUuid,
+    ...(destinationUuid ? { destination_uuid: destinationUuid } : {}),
     environment_name: spec.environment,
     name: spec.slug,
     docker_registry_image_name: imageName,

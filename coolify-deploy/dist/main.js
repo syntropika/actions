@@ -109,7 +109,7 @@ function selected(input, override, context) {
 }
 function applicationSpec(value, selection) {
   const input = object(value, "Application file");
-  const allowed = new Set(["slug", "project", "server", "environment", "create_if_missing", "create", "update", "storages"]);
+  const allowed = new Set(["slug", "project", "server", "destination", "environment", "create_if_missing", "create", "update", "storages"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key))
       throw new Error(`Application file has unsupported field ${key}`);
@@ -131,7 +131,7 @@ function applicationSpec(value, selection) {
   }
   if (typeof createIfMissing !== "boolean")
     throw new Error("create_if_missing must be true or false");
-  const reserved = ["project_uuid", "server_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
+  const reserved = ["project_uuid", "server_uuid", "destination_uuid", "environment_name", "environment_uuid", "name", "docker_registry_image_name", "docker_registry_image_tag", "instant_deploy"];
   const create = options(input.create, "Application create options", reserved);
   const update = options(input.update, "Application update options", [...reserved, "build_pack"]);
   const storages = input.storages === undefined ? [] : list(input.storages, "Application storages").map((entry, index) => {
@@ -157,11 +157,13 @@ function applicationSpec(value, selection) {
   }
   const project = selected(input.project, selection.project, "Application project");
   const server = selected(input.server, selection.server, "Application server");
+  const destination = selected(input.destination, selection.destination, "Application destination");
   const environment = selected(input.environment, selection.environment, "Application environment");
   return {
     slug,
     project: project === undefined ? "" : string(project, "Application project"),
     server: server === undefined ? "" : string(server, "Application server"),
+    destination: destination === undefined ? "" : string(destination, "Application destination"),
     environment: environment === undefined ? "production" : string(environment, "Application environment"),
     create_if_missing: createIfMissing,
     create,
@@ -187,6 +189,12 @@ async function resolveApplication(spec, imageName, imageTag, api) {
   const servers = list(await api.expect("GET", "servers"), "Coolify servers");
   const server = select(servers, spec.server, "server");
   const serverUuid = identifier(server.uuid, "Server UUID");
+  let destinationUuid;
+  if (spec.destination) {
+    const destinations = list(await api.expect("GET", "destinations"), "Coolify destinations");
+    const destination = select(destinations.filter((item) => item.server_uuid === serverUuid), spec.destination, "destination");
+    destinationUuid = identifier(destination.uuid, "Destination UUID");
+  }
   const applications = list(await api.expect("GET", "applications"), "Coolify applications");
   const candidates = applications.filter((item) => item.name === spec.slug && item.environment_id === environment.id);
   const matches = [];
@@ -197,7 +205,7 @@ async function resolveApplication(spec, imageName, imageTag, api) {
     if (primary.length !== 1 || typeof primary[0]?.server_uuid !== "string") {
       throw new Error(`Application ${uuid} has no identifiable primary server`);
     }
-    if (primary[0].server_uuid === serverUuid)
+    if (primary[0].server_uuid === serverUuid && (!destinationUuid || primary[0].uuid === destinationUuid))
       matches.push(candidate);
   }
   if (matches.length > 1)
@@ -215,6 +223,7 @@ async function resolveApplication(spec, imageName, imageTag, api) {
     ...spec.create,
     project_uuid: projectUuid,
     server_uuid: serverUuid,
+    ...destinationUuid ? { destination_uuid: destinationUuid } : {},
     environment_name: spec.environment,
     name: spec.slug,
     docker_registry_image_name: imageName,
@@ -523,13 +532,14 @@ async function deploy(inputs, deps = defaultDependencies) {
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
   const applicationRequested = Boolean(inputs.applicationSlug || inputs.applicationFile);
-  if (!applicationRequested && (inputs.project || inputs.server || inputs.environment || inputs.createIfMissing)) {
-    throw new Error("project, server, environment, and create-if-missing require application-slug or application-file");
+  if (!applicationRequested && (inputs.project || inputs.server || inputs.destination || inputs.environment || inputs.createIfMissing)) {
+    throw new Error("project, server, destination, environment, and create-if-missing require application-slug or application-file");
   }
   const application = applicationRequested ? applicationSpec(inputs.applicationFile ? await jsonFile(inputs.applicationFile, "Application", deps) : {}, {
     slug: inputs.applicationSlug,
     project: inputs.project,
     server: inputs.server,
+    destination: inputs.destination,
     environment: inputs.environment,
     createIfMissing: inputs.createIfMissing
   }) : undefined;
@@ -728,6 +738,7 @@ var inputs = {
   applicationSlug: input("application-slug"),
   project: input("project"),
   server: input("server"),
+  destination: input("destination"),
   environment: input("environment"),
   createIfMissing: input("create-if-missing"),
   applicationFile: input("application-file"),

@@ -14,6 +14,7 @@ export interface Inputs {
   applicationSlug: string;
   project: string;
   server: string;
+  destination: string;
   environment: string;
   createIfMissing: string;
   applicationFile: string;
@@ -335,14 +336,15 @@ export async function deploy(inputs: Inputs, deps: Dependencies = defaultDepende
   const uuids = csv(inputs.uuids).map((uuid) => pathPart(uuid, "uuids"));
   const tags = csv(inputs.tags);
   const applicationRequested = Boolean(inputs.applicationSlug || inputs.applicationFile);
-  if (!applicationRequested && (inputs.project || inputs.server || inputs.environment || inputs.createIfMissing)) {
-    throw new Error("project, server, environment, and create-if-missing require application-slug or application-file");
+  if (!applicationRequested && (inputs.project || inputs.server || inputs.destination || inputs.environment || inputs.createIfMissing)) {
+    throw new Error("project, server, destination, environment, and create-if-missing require application-slug or application-file");
   }
   const application = applicationRequested
     ? applicationSpec(inputs.applicationFile ? await jsonFile(inputs.applicationFile, "Application", deps) : {}, {
       slug: inputs.applicationSlug,
       project: inputs.project,
       server: inputs.server,
+      destination: inputs.destination,
       environment: inputs.environment,
       createIfMissing: inputs.createIfMissing,
     })

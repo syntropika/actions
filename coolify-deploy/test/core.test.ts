@@ -11,6 +11,7 @@ function inputs(overrides: Partial<Inputs> = {}): Inputs {
     applicationSlug: "",
     project: "",
     server: "",
+    destination: "",
     environment: "",
     createIfMissing: "",
     applicationFile: "",
@@ -299,6 +300,10 @@ describe("Coolify deployment", () => {
       [200, [{ uuid: "project123", name: "syntropika" }]],
       [200, [{ id: 42, name: "production" }]],
       [200, [{ uuid: "server123", name: "ovh1" }]],
+      [200, [
+        { uuid: "destination123", name: "coolify", server_uuid: "server123" },
+        { uuid: "destination456", name: "other", server_uuid: "server123" },
+      ]],
       [200, []],
       [201, { uuid: "newapp123" }],
       [201, {}],
@@ -308,7 +313,7 @@ describe("Coolify deployment", () => {
       [200, { deployments: [{ resource_uuid: "newapp123" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) }, { COOLIFY_ENV_API_KEY: "private-value" });
     const result = await deploy(inputs({
-      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1", destination: "coolify",
       environment: "production", createIfMissing: "true", applicationFile: "/tmp/app.json",
       imageName: "ghcr.io/org/app", imageTag: "commit123",
       requiredEnvKeys: "API_KEY", wait: "false",
@@ -318,6 +323,7 @@ describe("Coolify deployment", () => {
       "GET /api/v1/projects",
       "GET /api/v1/projects/project123/environments",
       "GET /api/v1/servers",
+      "GET /api/v1/destinations",
       "GET /api/v1/applications",
       "POST /api/v1/applications/dockerimage",
       "POST /api/v1/applications/newapp123/storages",
@@ -326,18 +332,18 @@ describe("Coolify deployment", () => {
       "PATCH /api/v1/applications/newapp123",
       "POST /api/v1/deploy",
     ]);
-    expect(f.calls[4]?.body).toEqual({
+    expect(f.calls[5]?.body).toEqual({
       autogenerate_domain: false, health_check_enabled: false,
-      project_uuid: "project123", server_uuid: "server123", environment_name: "production",
+      project_uuid: "project123", server_uuid: "server123", destination_uuid: "destination123", environment_name: "production",
       name: "call-recorder-bot", docker_registry_image_name: "ghcr.io/org/app",
       docker_registry_image_tag: "commit123", instant_deploy: false,
     });
-    expect(f.calls[5]?.body).toEqual({ type: "persistent", name: "call-recorder-data", mount_path: "/app/data" });
-    expect(f.calls[8]?.body).toEqual({
+    expect(f.calls[6]?.body).toEqual({ type: "persistent", name: "call-recorder-data", mount_path: "/app/data" });
+    expect(f.calls[9]?.body).toEqual({
       is_consistent_container_name_enabled: true, stop_grace_period: 300,
       docker_registry_image_tag: "commit123",
     });
-    expect(f.calls[9]?.body).toEqual({ uuid: "newapp123", force: false });
+    expect(f.calls[10]?.body).toEqual({ uuid: "newapp123", force: false });
     expect(JSON.stringify(f.logs)).not.toContain("private-value");
   });
 
@@ -348,20 +354,24 @@ describe("Coolify deployment", () => {
       [200, [{ id: 42, name: "production" }]],
       [200, [{ uuid: "server123", name: "ovh1" }]],
       [200, [
+        { uuid: "destination123", name: "coolify", server_uuid: "server123" },
+        { uuid: "destination456", name: "other", server_uuid: "server123" },
+      ]],
+      [200, [
         { uuid: "elsewhere123", name: "call-recorder-bot", environment_id: 42,
           build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" },
         { uuid: "existing123", name: "call-recorder-bot", environment_id: 42,
           build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" },
       ]],
-      [200, [{ is_primary: true, server_uuid: "other-server" }]],
-      [200, [{ is_primary: true, server_uuid: "server123" }]],
+      [200, [{ is_primary: true, server_uuid: "server123", uuid: "destination456" }]],
+      [200, [{ is_primary: true, server_uuid: "server123", uuid: "destination123" }]],
       [200, { persistent_storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] }],
       [200, { build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" }],
       [200, { uuid: "existing123" }],
       [200, { deployments: [{ resource_uuid: "existing123" }] }],
     ], { "/tmp/app.json": JSON.stringify(spec) });
     const result = await deploy(inputs({
-      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1", destination: "coolify",
       environment: "production", applicationFile: "/tmp/app.json",
       imageName: "ghcr.io/org/app", imageTag: "commit456", wait: "false",
     }), f.deps);
@@ -370,6 +380,7 @@ describe("Coolify deployment", () => {
       "GET /api/v1/projects",
       "GET /api/v1/projects/project123/environments",
       "GET /api/v1/servers",
+      "GET /api/v1/destinations",
       "GET /api/v1/applications",
       "GET /api/v1/applications/elsewhere123/destinations",
       "GET /api/v1/applications/existing123/destinations",
