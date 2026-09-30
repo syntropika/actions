@@ -365,7 +365,7 @@ describe("Coolify deployment", () => {
       ]],
       [200, [{ is_primary: true, server_uuid: "server123", uuid: "destination456" }]],
       [200, [{ is_primary: true, server_uuid: "server123", uuid: "destination123" }]],
-      [200, { persistent_storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] }],
+      [200, { persistent_storages: [{ name: "existing123-call-recorder-data", mount_path: "/app/data" }] }],
       [200, { build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" }],
       [200, { uuid: "existing123" }],
       [200, { deployments: [{ resource_uuid: "existing123" }] }],
@@ -431,19 +431,25 @@ describe("Coolify deployment", () => {
 
   test("does not deploy when an existing persistent volume conflicts", async () => {
     const spec = { storages: [{ name: "call-recorder-data", mount_path: "/app/data" }] };
-    const f = fixture([
-      [200, [{ uuid: "project123", name: "syntropika" }]],
-      [200, [{ id: 42, name: "production" }]],
-      [200, [{ uuid: "server123", name: "ovh1" }]],
-      [200, [{ uuid: "existing123", name: "call-recorder-bot", environment_id: 42,
-        build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" }]],
-      [200, [{ is_primary: true, server_uuid: "server123" }]],
-      [200, { persistent_storages: [{ name: "call-recorder-data", mount_path: "/wrong" }] }],
-    ], { "/tmp/app.json": JSON.stringify(spec) });
-    await expect(deploy(inputs({
-      uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
-      applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
-    }), f.deps)).rejects.toThrow("conflicts with an existing storage");
-    expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+    for (const storage of [
+      { name: "call-recorder-data", mount_path: "/wrong" },
+      { name: "existing123-call-recorder-data", mount_path: "/wrong" },
+      { name: "otherapp-call-recorder-data", mount_path: "/app/data" },
+    ]) {
+      const f = fixture([
+        [200, [{ uuid: "project123", name: "syntropika" }]],
+        [200, [{ id: 42, name: "production" }]],
+        [200, [{ uuid: "server123", name: "ovh1" }]],
+        [200, [{ uuid: "existing123", name: "call-recorder-bot", environment_id: 42,
+          build_pack: "dockerimage", docker_registry_image_name: "ghcr.io/org/app" }]],
+        [200, [{ is_primary: true, server_uuid: "server123" }]],
+        [200, { persistent_storages: [storage] }],
+      ], { "/tmp/app.json": JSON.stringify(spec) });
+      await expect(deploy(inputs({
+        uuids: "", applicationSlug: "call-recorder-bot", project: "syntropika", server: "ovh1",
+        applicationFile: "/tmp/app.json", imageName: "ghcr.io/org/app", imageTag: "commit123",
+      }), f.deps)).rejects.toThrow("conflicts with an existing storage");
+      expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+    }
   });
 });

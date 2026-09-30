@@ -206,8 +206,11 @@ export async function syncPersistentStorages(
     "Coolify persistent storages",
   );
   for (const storage of spec.storages) {
-    const matching = existing.filter((entry) => entry.name === storage.name || entry.mount_path === storage.mount_path);
-    if (matching.length > 1 || matching.some((entry) => entry.name !== storage.name || entry.mount_path !== storage.mount_path)) {
+    const coolifyName = `${uuid}-${storage.name}`;
+    const matching = existing.filter((entry) =>
+      entry.name === storage.name || entry.name === coolifyName || entry.mount_path === storage.mount_path);
+    if (matching.length > 1 || matching.some((entry) =>
+      (entry.name !== storage.name && entry.name !== coolifyName) || entry.mount_path !== storage.mount_path)) {
       throw new Error(`Persistent storage ${storage.name} conflicts with an existing storage`);
     }
     if (matching.length === 0) {
